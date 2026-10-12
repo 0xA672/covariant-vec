@@ -1,0 +1,133 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-stable:
+    name: test (stable, cow)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --features cow
+      - run: cargo test --no-default-features
+      # Debug assertions catch invariant violations; release mode additionally
+      # exercises the `debug_assert!`-free paths (e.g. the `assert!` ZST guards
+      # and the saturating growth checks that only bite in optimized builds).
+      - run: cargo test --release --features cow
+      - run: cargo test --release --no-default-features
+      # `TryReserveError: core::error::Error` is gated on a build-script cfg
+      # probed from `rustc --version`; if that probe silently failed, the impl
+      # (and its gated unit test) would just disappear. Every toolchain this
+      # job uses is >= 1.81, so the cfg must be present.
+      - run: cargo rustc --features cow -- --print cfg | grep -qx 'has_error_trait'
+
+  test-nightly:
+    name: test (nightly, all features incl. dropck_eyepatch)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      # `dropck_eyepatch` is a nightly-only feature gate, so the full feature
+      # set (and the leniency tests it unlocks) only build on nightly.
+      - run: cargo test --all-features
+      - run: cargo test --release --all-features
+
+  test-nightly-pinned:
+    name: test (nightly pinned to minimum known-good)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # `specialization` is incomplete: the accepted shape of the trait-bound
+      # impl pair this crate needs has moved between nightlies and may move
+      # again (coherence/min_specialization tightenings). This job pins the
+      # oldest nightly known to build all features (recorded next to the
+      # `specialization` feature in Cargo.toml), so a future compiler-side
+      # tightening surfaces as a failure in the floating `test-nightly` job
+      # above — the canary — rather than as an unexplained break here.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-01-16
+      - run: cargo test --all-features
+      - run: cargo test --release --all-features
+
+  sanitizers:
+    name: asan + lsan (nightly)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      # AddressSanitizer catches heap-buffer-overflow / use-after-free in the
+      # raw-pointer machinery (spill, realloc, drain rollback, ZST counts) that
+      # Miri's own allocator model can miss. `-Zbuild-std` instruments the
+      # standard library too, avoiding interceptor mismatches.
+      - run: cargo test --all-features -Zbuild-std --target x86_64-unknown-linux-gnu
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+          RUSTDOCFLAGS: -Zsanitizer=address
+      # LeakSanitizer: the only intentional leaks are the `mem::forget` ZST
+      # protocol and the `Drain`/`mem::forget` documented cases; a leak here
+      # would mean an owned element was silently dropped without its destructor.
+      - run: cargo test --all-features -Zbuild-std --target x86_64-unknown-linux-gnu
+        env:
+          RUSTFLAGS: -Zsanitizer=leak
+          RUSTDOCFLAGS: -Zsanitizer=leak
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy
+      - run: cargo clippy --all-features --all-targets -- -D warnings
+
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo doc --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # The design reasons explicitly in Stacked-Borrows terms, so make the check
+  # mechanical. Tree Borrows is run as well because it is the aliasing model
+  # `std` is migrating toward, and the two disagree on some reborrow patterns.
+  miri-stacked:
+    name: miri (stacked borrows)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - run: cargo miri test --all-features
+        env:
+          # `many-seeds` re-runs each test under several random schedules, which
+          # is where an interleaving-dependent reborrow mistake would surface.
+          MIRIFLAGS: -Zmiri-strict-provenance -Zmiri-many-seeds=0..8
+      - run: cargo miri test --no-default-features
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance -Zmiri-many-seeds=0..8
+
+  miri-tree:
+    name: miri (tree borrows)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - run: cargo miri test --all-features
+        env:
+          MIRIFLAGS: -Zmiri-tree-borrows -Zmiri-strict-provenance -Zmiri-many-seeds=0..8

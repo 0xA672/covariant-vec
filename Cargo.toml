@@ -1,0 +1,50 @@
+[package]
+name = "covariant-vec"
+version = "0.1.0"
+edition = "2021"
+# MSRV: 1.80. The floor is set by bare `size_of`/`align_of` in the prelude
+# (1.80) and inline `const {}` blocks (1.79); const generics and `addr_of!`
+# need 1.51+. `dropck_eyepatch` and `specialization` additionally require a
+# nightly compiler.
+rust-version = "1.80"
+description = "A covariant small-vector whose heap/inline discrimination bit is encoded in the length field."
+license = "MIT OR Apache-2.0"
+categories = ["data-structures", "no-std"]
+keywords = ["smallvec", "vec", "covariant", "no_std", "union"]
+
+[features]
+default = []
+# Enables `#[may_dangle]` on the Drop impl (RFC 1238).
+#
+# NIGHTLY ONLY: this turns on `#![feature(dropck_eyepatch)]`, which a stable
+# compiler rejects. Stable builds must leave it off (the default); dropck is
+# then strict, and the lifetime-leniency tests in `tests/dropck.rs` are
+# `#![cfg(feature = "dropck_eyepatch")]`-gated accordingly.
+dropck_eyepatch = []
+# Enables the `T: Copy` bulk-copy fast path in every clone loop.
+#
+# NIGHTLY ONLY: this turns on `#![feature(specialization)]`, which a stable
+# compiler rejects. Stable builds must leave it off (the default), where every
+# clone loop is the element-wise one. With it on, `Clone` (both containers),
+# `CovariantCow::to_mut` and `CovariantCow::try_materialize` dispatch to a
+# single `ptr::copy_nonoverlapping` for `T: Copy`, keyed *exactly* on `T: Copy`
+# (std's `Vec` does the same). The stable element-wise behaviour — including
+# per-element length publication, hence panic safety — is unchanged for every
+# other type, `Copy` or not.
+#
+# Note the compiler feature is the *full* one, not `min_specialization`: the
+# sound subset rejects trait-bound specialization outright ("cannot specialize
+# on trait `Copy`"), and keying on `T: Copy` is exactly what std parity needs.
+# The crate only uses the well-understood impl-vs-impl form; see
+# `src/clone_fill.rs` for the full rationale and the soundness argument.
+#
+# Minimum known-good nightly: nightly-2026-01-16 (1.94.0-nightly). The
+# accepted shape of this specialization has moved between nightlies before and
+# may move again; CI pins that date for the `test-nightly-pinned` job and runs
+# floating nightly as the canary. Bump the date deliberately, with a green
+# `cargo test --all-features` on the new pin.
+specialization = []
+# Enables the optional three-state copy-on-write `CovariantCow`. Stable-safe.
+cow = []
+
+[dependencies]
