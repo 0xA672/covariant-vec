@@ -8,6 +8,7 @@ edition = "2021"
 # nightly compiler.
 rust-version = "1.80"
 description = "A covariant small-vector whose heap/inline discrimination bit is encoded in the length field."
+repository = "https://github.com/0xA672/covariant-vec"
 license = "MIT OR Apache-2.0"
 categories = ["data-structures", "no-std"]
 keywords = ["smallvec", "vec", "covariant", "no_std", "union"]
