@@ -1,6 +1,6 @@
 [package]
 name = "covariant-vec"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 # MSRV: 1.80. The floor is set by bare `size_of`/`align_of` in the prelude
 # (1.80) and inline `const {}` blocks (1.79); const generics and `addr_of!`
