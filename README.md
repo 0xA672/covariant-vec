@@ -19,9 +19,9 @@ assert_eq!(&*v, &[1, 2, 3, 4, 5]);
 - **Length-encoded state tag.** No data-embedded sentinel, no extra discriminant word. `len`'s top bit is `HEAP_TAG`; `CovariantVec<u64, 4>` is exactly 40 bytes (`N·S + W`).
 - **Covariant in both `'a` and `T`.** The `'a` parameter is a variance anchor (`PhantomData<&'a ()>`), so `CovariantVec<'src, Label<'src>, N>` is the intended shape; variance is pinned at compile time in `tests/variance.rs`.
 - **Lenient dropck (nightly).** With the `dropck_eyepatch` feature, `#[may_dangle]` is applied to **both** `'a` and `T`, so a container can be dropped after its lifetime has expired.
-- **Fallible allocation everywhere.** `try_reserve` / `try_reserve_exact` return `TryReserveError` on capacity overflow or `alloc` failure, without unstable APIs.
+- **Fallible allocation everywhere.** `try_reserve` / `try_reserve_exact` / `try_to_mut` return `TryReserveError` on capacity overflow or `alloc` failure, without unstable APIs.
 - **Optional copy-on-write (`cow`).** `CovariantCow<'a, T, N>` adds a zero-copy `Borrowed` state by spending bit 62 of the length word, with owned-only `_owned` methods so `!Clone` types remain usable when the cow is known to be owned.
-- **Nightly `T: Copy` fast paths (`specialization`).** `Clone`, `to_mut`, and `try_materialize` switch to a single `ptr::copy_nonoverlapping` for `T: Copy` — same code path, same panic safety, same observable behavior. Stable builds always take the element-wise loop.
+- **Nightly `T: Copy` fast paths (`specialization`).** `Clone`, `to_mut`/`try_to_mut`, and the fallible materializers switch to a single `ptr::copy_nonoverlapping` for `T: Copy` — same code path, same panic safety, same observable behavior. Stable builds always take the element-wise loop.
 
 ## Feature flags
 
@@ -46,10 +46,13 @@ For a zero-sized `T`, no bytes are ever stored; the **count is the ownership**. 
 
 Every site is annotated in the source; a change that breaks the balance is a change that either double-counts or double-drops.
 
+## Bulk operations
+
+`append`, `split_off`, `splice` and `extract_if` are provided natively over the two-state encoding — no `Vec` round-trip. An inline-to-inline `append` that fits allocates nothing; `split_off` state-normalizes its result like `Clone`; `splice` refills the drained region's dead slots in place and writes a longer replacement in geometrically growing chunks (one tail shift for an exact size hint); `extract_if` shares `retain_mut`'s backshift scan and publishes an empty length for the scan (forget → leak, never double-drop). `extend_from_slice` is the stable `T: Copy` bulk append: one `memcpy`, one length publication, and on a borrowed cow it fuses materialization with the reservation. `sort*`/`dedup*` remain reachable through `DerefMut`.
+
 ## Deliberately not provided
 
-- `append` / `split_off` / `splice` / `extract_if` — omitted to keep the unsafe surface small. `sort*`/`dedup*` are reachable through `DerefMut`, and a `Vec` round-trip covers the rest.
-- A stable `T: Copy` bulk-copy fast path — specialization is the only mechanism that keys on `T: Copy` exactly, and it is nightly-only.
+- A stable `T: Copy` specialization of the *clone loops* — specialization is the only mechanism that keys on `T: Copy` exactly, and it is nightly-only. (`extend_from_slice` is the stable bulk-copy entry point; it takes `&[T]`, so it needs no specialization.)
 - An `Option` niche — the tag lives inside a plain `usize`, whose every bit pattern is valid; rustc cannot see "bit 63 set ⇒ heap". `Option<CovariantVec>` pays the full discriminant word.
 
 ## Copy-on-write

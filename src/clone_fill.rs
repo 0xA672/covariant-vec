@@ -10,9 +10,11 @@
 //!   container is invalidated by the length publication that follows it. The
 //!   element-wise loop therefore re-derives the slot pointer (via
 //!   [`CloneSink::raw_base`]) after every [`CloneSink::publish_len`] call.
-//!   [`CloneSink`] deliberately exposes *exactly* those two reborrowing
-//!   operations and nothing else, so the discipline is expressed by
-//!   construction: there is no way to hold a slot pointer across a publish.
+//!   [`CloneSink`] deliberately exposes only those two reborrowing operations
+//!   as low-level primitives, so the discipline is expressed by construction:
+//!   there is no way to hold a slot pointer across a publish. The range-fill
+//!   convenience ([`CloneSink::fill_range`]) is built on them and never hands
+//!   a pointer out.
 //!   (In the heap state a hoisted pointer would be sound — it points into an
 //!   independent block — and the re-derivation folds there anyway: `raw_base`
 //!   is a constant offset in the inline state and a load of a field that
@@ -35,6 +37,13 @@
 //! `!Copy` type with a side-effectful `Clone` would silently stop running
 //! `clone`, a semantic deviation `std` refuses to make.
 //!
+//! The same substitution covers the range form
+//! ([`CloneFill::clone_fill_range`], reached through
+//! [`CloneSink::fill_range`]): `T: Copy` copies the whole range in one go,
+//! `T: Clone` runs the element-wise loop starting at `start`. That is what
+//! lets [`CovariantCow::append`](crate::CovariantCow::append)'s
+//! borrowed-source path bulk-copy into an already-populated destination.
+//!
 //! On stable (feature off) every element type takes the element-wise loop; the
 //! two are the same code path with the same publication points, so the feature
 //! changes speed only, never behaviour or panic-safety.
@@ -56,10 +65,10 @@
 //! unreachable. The crate carries `#[allow(incomplete_features)]` next to the
 //! feature gate; it is scoped to the feature, so stable builds never see it.
 
-/// Destination for [`CloneFill::clone_fill`]: the two container operations the
-/// clone loops need.
+/// Destination for the clone loops: the two container operations they need,
+/// plus the range-fill convenience built on them.
 ///
-/// Both operations reborrow the container, which is what makes the inline
+/// The two primitives reborrow the container, which is what makes the inline
 /// state's Stacked-Borrows discipline expressible: a pointer derived from
 /// `raw_base` must never be held across a `publish_len` call.
 pub(crate) trait CloneSink {
@@ -79,6 +88,38 @@ pub(crate) trait CloneSink {
     ///
     /// Slots `[0, n)` must be initialized.
     unsafe fn publish_len(&mut self, n: usize);
+
+    /// Fills slots `[start, start + len)` by cloning from `src`, publishing
+    /// the length after each element (a single bulk copy and publication for
+    /// `T: Copy`).
+    ///
+    /// This is the range counterpart of [`CloneFill::clone_fill`], for sinks
+    /// that already hold `start` elements. It is a provided method so the
+    /// container impls stay down to the two reborrowing primitives above; the
+    /// body forwards to the element-keyed [`CloneFill`], which is where the
+    /// `T: Copy` specialization lives (a container-keyed trait cannot see the
+    /// element's `Copy`-ness).
+    ///
+    /// # Safety
+    ///
+    /// * `src` must be valid for reads of `len` initialized `Self::Elem`
+    ///   values, and its storage must not overlap the sink's.
+    /// * The sink must be owned, with published length `start`, capacity
+    ///   `>= start + len`, and slots `[start, start + len)` uninitialized.
+    // Only the cow's borrowed-source `append` uses the range form (the
+    // two-state `append` is a raw move), so it is dead code in a `cow`-less
+    // build.
+    #[cfg_attr(not(feature = "cow"), allow(dead_code))]
+    #[inline]
+    unsafe fn fill_range(&mut self, src: *const Self::Elem, start: usize, len: usize)
+    where
+        Self: Sized,
+        Self::Elem: Clone,
+    {
+        // Safety: forwarded from the caller. `Self: CloneSink<Elem = ...>` is
+        // exactly the bound `CloneFill` requires.
+        unsafe { <Self::Elem as CloneFill<Self>>::clone_fill_range(src, self, start, len) }
+    }
 }
 
 /// Element-fill strategy: the `T: Copy` `memcpy` path under the nightly-only
@@ -95,21 +136,50 @@ pub(crate) trait CloneFill<C: CloneSink> {
     /// * `dest` must be owned with published length 0, capacity `>= len`, and
     ///   storage that does not overlap `src`.
     unsafe fn clone_fill(src: *const Self, dest: &mut C, len: usize);
+
+    /// Fills `dest`'s slots `[start, start + len)` by cloning from `src`.
+    ///
+    /// The range-fill primitive: the destination already holds `start`
+    /// elements (its published length is `start`). For `T: Copy` it is one
+    /// bulk copy plus one publication — no per-element `raw_base`
+    /// re-derivation — which is what lets [`CovariantCow::append`]'s
+    /// borrowed-source path take the `memcpy` route instead of extending
+    /// from `iter().cloned()`. For `!Copy` it is the same element-wise loop
+    /// as [`Self::clone_fill`], with the same per-element publication points.
+    ///
+    /// [`CovariantCow::append`]: crate::CovariantCow::append
+    ///
+    /// # Safety
+    ///
+    /// * `src` must be valid for reads of `len` initialized `Self` values.
+    /// * `dest` must be owned with published length `start`, capacity
+    ///   `>= start + len`, and storage that does not overlap `src`.
+    /// * Slots `[start, start + len)` must be uninitialized.
+    // See `CloneSink::fill_range`: only the `cow` feature reaches this.
+    #[cfg_attr(not(feature = "cow"), allow(dead_code))]
+    unsafe fn clone_fill_range(src: *const Self, dest: &mut C, start: usize, len: usize);
 }
 
-/// The element-wise loop: clone, write, publish, per element.
+/// The element-wise loop: clone, write, publish, per element, starting at
+/// slot `start`.
 #[inline]
-unsafe fn elementwise<T: Clone, C: CloneSink<Elem = T>>(src: *const T, dest: &mut C, len: usize) {
+unsafe fn elementwise<T: Clone, C: CloneSink<Elem = T>>(
+    src: *const T,
+    dest: &mut C,
+    start: usize,
+    len: usize,
+) {
     for i in 0..len {
         // Safety: `src` is valid for `len` reads (caller contract).
         let v = unsafe { (&*src.add(i)).clone() };
-        // Safety: slot `i` is uninitialized (caller contract). `raw_base` is
-        // re-called every iteration on purpose: it reborrows `dest`, and the
-        // `publish_len` below invalidates a pointer derived earlier (in the
-        // inline state the elements live inside `dest` itself).
-        unsafe { dest.raw_base().add(i).write(v) };
-        // Safety: slots `[0, i + 1)` are initialized.
-        unsafe { dest.publish_len(i + 1) };
+        // Safety: slot `start + i` is uninitialized (caller contract).
+        // `raw_base` is re-called every iteration on purpose: it reborrows
+        // `dest`, and the `publish_len` below invalidates a pointer derived
+        // earlier (in the inline state the elements live inside `dest`
+        // itself).
+        unsafe { dest.raw_base().add(start + i).write(v) };
+        // Safety: slots `[0, start + i + 1)` are initialized.
+        unsafe { dest.publish_len(start + i + 1) };
     }
 }
 
@@ -117,7 +187,12 @@ unsafe fn elementwise<T: Clone, C: CloneSink<Elem = T>>(src: *const T, dest: &mu
 impl<T: Clone, C: CloneSink<Elem = T>> CloneFill<C> for T {
     unsafe fn clone_fill(src: *const T, dest: &mut C, len: usize) {
         // Safety: forwarded from the caller.
-        unsafe { elementwise(src, dest, len) }
+        unsafe { elementwise(src, dest, 0, len) }
+    }
+
+    unsafe fn clone_fill_range(src: *const T, dest: &mut C, start: usize, len: usize) {
+        // Safety: forwarded from the caller.
+        unsafe { elementwise(src, dest, start, len) }
     }
 }
 

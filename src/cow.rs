@@ -55,7 +55,7 @@ use alloc::vec::Vec;
 #[cfg(feature = "specialization")]
 use crate::clone_fill::CloneRepeat;
 use crate::clone_fill::{CloneFill, CloneSink};
-use crate::{try_heap_layout, TryReserveError, HEAP_TAG};
+use crate::{try_heap_layout, BackshiftTarget, TryReserveError, HEAP_TAG};
 
 /// Borrowed-state tag: bit 62.
 const BORROWED_TAG: usize = 1 << (usize::BITS - 2);
@@ -96,6 +96,10 @@ union Data3<'a, T, const N: usize> {
 /// | [`remove`](Self::remove) | [`remove_owned`](Self::remove_owned) |
 /// | [`swap_remove`](Self::swap_remove) | [`swap_remove_owned`](Self::swap_remove_owned) |
 /// | [`drain`](Self::drain) | [`drain_owned`](Self::drain_owned) |
+/// | [`append`](Self::append) | [`append_owned`](Self::append_owned) |
+/// | [`split_off`](Self::split_off) | — (no `Clone` needed) |
+/// | [`splice`](Self::splice) | [`splice_owned`](Self::splice_owned) |
+/// | [`extract_if`](Self::extract_if) | [`extract_if_owned`](Self::extract_if_owned) |
 /// | [`resize_with`](Self::resize_with) | [`resize_with_owned`](Self::resize_with_owned) |
 /// | [`into_vec`](Self::into_vec) | [`into_vec_owned`](Self::into_vec_owned) |
 /// | [`Extend`] | [`extend_owned`](Self::extend_owned) |
@@ -106,8 +110,50 @@ union Data3<'a, T, const N: usize> {
 /// Every other borrowed-aware method above has an owned-only twin, so an owned
 /// cow of a `!Clone` type can still mutate in every way that does not clone.
 ///
+/// [`split_off`](Self::split_off) is the exception in the other direction: it
+/// needs no `Clone` even on a borrowed cow, because it splits the borrow into
+/// two disjoint sub-slices instead of materializing it. [`append`](Self::append)
+/// with a borrowed `other` likewise clones that borrow directly into `self`
+/// (fused into a single allocation when `self` is borrowed too) instead of
+/// materializing `other` first.
+///
+/// # Panicking vs. copy-on-write mutable access
+///
+/// Raw or unchecked mutable access cannot copy-on-write: it carries no
+/// `T: Clone` bound, and the caller would keep a pointer into storage that a
+/// later materialization replaces. Those methods **panic** on a borrowed cow.
+/// The safe mutable views and iteration APIs instead copy-on-write through
+/// [`to_mut`](Self::to_mut):
+///
+/// | panics if borrowed | copy-on-write |
+/// |---|---|
+/// | [`as_mut_slice`](Self::as_mut_slice) | [`DerefMut`] (`&mut cow[..]`, `iter_mut`, indexing) |
+/// | [`as_mut_ptr`](Self::as_mut_ptr) | [`AsMut`] |
+/// | [`set_len`](Self::set_len) | [`BorrowMut`] |
+/// | [`spare_capacity_mut_owned`](Self::spare_capacity_mut_owned) | the borrowed-aware mutation methods above |
+///
+/// The rule is mechanical: no `T: Clone` bound, no materialization.
+///
+/// # Which operations materialize a borrow?
+///
+/// A borrowed cow is narrowed **zero-copy** (stays borrowed; no clone, no
+/// drop) by the shrinking operations: [`pop`](Self::pop),
+/// [`truncate`](Self::truncate), [`clear`](Self::clear), the shrinking arm
+/// of [`resize`](Self::resize), and [`split_off`](Self::split_off) (which
+/// splits the borrow into two disjoint sub-slices). It must be
+/// **materialized** by operations that need contiguous mutable storage:
+/// [`push`](Self::push), [`insert`](Self::insert),
+/// [`remove`](Self::remove), [`swap_remove`](Self::swap_remove), a
+/// non-empty [`drain`](Self::drain), [`retain`](Self::retain),
+/// [`extract_if`](Self::extract_if), a [`splice`](Self::splice) over a
+/// non-empty range or with a replacement that may yield, and
+/// [`append`](Self::append) when `self` is borrowed.
+/// [`append`](Self::append) with a borrowed `other` clones that borrow
+/// directly and never materializes `other`.
+///
 /// The fallible [`try_reserve`](Self::try_reserve) /
 /// [`try_reserve_exact`](Self::try_reserve_exact) (and their `_owned` twins)
+/// and [`try_to_mut`](Self::try_to_mut) (the fallible twin of `to_mut`)
 /// report capacity overflow and allocation failure as
 /// [`TryReserveError`](crate::TryReserveError) instead of panicking/aborting.
 /// The borrowed-aware `reserve*` and `try_reserve*` alike fuse the
@@ -204,6 +250,19 @@ impl<'a, T, const N: usize> CovariantCow<'a, T, N> {
     /// Panics if `slice.len() > 2^62 - 1` (not representable in the length
     /// field); as a `const fn` this is a compile-time error in a `const`
     /// context.
+    ///
+    /// # Materialization
+    ///
+    /// Only the element count is checked here. Materializing the borrow —
+    /// [`to_mut`](Self::to_mut), [`reserve`](Self::reserve), or any mutating
+    /// operation — additionally requires the byte size to fit an allocation:
+    /// `slice.len() * size_of::<T>()`, rounded up to `align_of::<T>()`, at
+    /// most `isize::MAX`. A larger slice can still be borrowed, read, and
+    /// dropped, but the infallible materializers panic with
+    /// `"capacity overflow"` (or abort on allocation failure); the fallible
+    /// [`try_to_mut`](Self::try_to_mut) and
+    /// [`try_reserve`](Self::try_reserve) report it as
+    /// [`TryReserveError`](crate::TryReserveError) instead.
     #[must_use]
     pub const fn from_borrowed(slice: &'a [T]) -> Self {
         // `from_borrowed` does not go through `new()`, so repeat the
@@ -275,6 +334,28 @@ impl<'a, T, const N: usize> CovariantCow<'a, T, N> {
     #[track_caller]
     fn base_ptr(&mut self) -> *mut T {
         assert!(
+            !self.is_borrowed(),
+            "mutable element access on a borrowed CovariantCow"
+        );
+        // Safety: just checked.
+        unsafe { self.base_ptr_owned() }
+    }
+
+    /// Unchecked twin of [`Self::base_ptr`] for loops whose container is
+    /// statically known to be owned.
+    ///
+    /// The `CowIntoIter`/`CowDrain` constructors eagerly materialize a
+    /// borrowed cow, so their per-element loops would otherwise re-run the
+    /// same state test (and panic branch) for every element. The check is
+    /// kept as a `debug_assert!`.
+    ///
+    /// # Safety
+    ///
+    /// The cow must not be in the borrowed state. Deriving a `*mut T` from
+    /// the shared `&'a [T]` would be aliasing UB.
+    #[inline]
+    unsafe fn base_ptr_owned(&mut self) -> *mut T {
+        debug_assert!(
             !self.is_borrowed(),
             "mutable element access on a borrowed CovariantCow"
         );
@@ -434,11 +515,19 @@ impl<'a, T, const N: usize> CovariantCow<'a, T, N> {
                 // in `push_owned`). Adopt the `additional - 1` clones and then
                 // the original into the count: exactly `additional - 1` clones
                 // run, none of them drops, and the cow ends up owning
-                // `new_len` values.
+                // `new_len` values. The same tag-hygiene guard as `push_owned`:
+                // an untagged length write on a (buggy) heap-backed ZST cow
+                // would silently clear `HEAP_TAG` and leak the block.
+                assert!(!self.is_heap(), "ZST cows are never heap-backed");
                 for _ in 0..(additional - 1) {
                     assert!(self.raw_len() < MAX_LEN, "capacity overflow");
+                    // Clone *before* publishing: a panic inside `T::clone`
+                    // must not leave the count claiming a value that was
+                    // never created. The in-flight `value` is dropped by the
+                    // unwind, so the created values stay exactly balanced.
+                    let cloned = value.clone();
                     self.len = self.raw_len() + 1;
-                    mem::forget(value.clone());
+                    mem::forget(cloned);
                 }
                 assert!(self.raw_len() < MAX_LEN, "capacity overflow");
                 self.len = self.raw_len() + 1;
@@ -466,23 +555,50 @@ impl<'a, T, const N: usize> CovariantCow<'a, T, N> {
                     // `value` into the last one, so `T::clone` runs
                     // `additional - 1` times and no extra destructor is run for
                     // the original.
-                    for _ in 0..(additional - 1) {
-                        let v = value.clone();
+                    if self.is_heap() {
+                        // Hoisted heap loop: the block is independent of
+                        // `self`, so `base` survives the length publications;
+                        // `reserve_owned` already sized it for all
+                        // `additional` slots.
+                        let base = self.base_ptr();
+                        let mut l = self.raw_len();
+                        for _ in 0..(additional - 1) {
+                            let v = value.clone();
+                            // Safety: slot `l` is in bounds and uninitialized
+                            // (capacity reserved above); `base` stays valid
+                            // across the publication below.
+                            unsafe { base.add(l).write(v) };
+                            l += 1;
+                            // Published before the next `clone` (user code,
+                            // may panic), so a panic leaves the written prefix
+                            // counted.
+                            self.len = HEAP_TAG | l;
+                        }
+                        // Safety: as above, for the final uninitialized slot;
+                        // moving `value` in consumes it without running its
+                        // destructor here.
+                        unsafe { base.add(l).write(value) };
+                        self.len = HEAP_TAG | (l + 1);
+                    } else {
+                        for _ in 0..(additional - 1) {
+                            let v = value.clone();
+                            let l = self.raw_len();
+                            // Safety: owned state with capacity for
+                            // `additional` more elements, so slot `[l]` is in
+                            // bounds and uninitialized. The pointer is
+                            // re-derived each iteration because a write to
+                            // `self.len` is a use of `self` that invalidates
+                            // hoisted raw derivations under Stacked Borrows.
+                            unsafe { self.base_ptr().add(l).write(v) };
+                            self.len = (self.len & HEAP_TAG) | (l + 1);
+                        }
+                        // Safety: as above, for the final uninitialized slot;
+                        // moving `value` in consumes it without running its
+                        // destructor here.
                         let l = self.raw_len();
-                        // Safety: owned state with capacity for `additional`
-                        // more elements, so slot `[l]` is in bounds and
-                        // uninitialized. The pointer is re-derived each
-                        // iteration because a write to `self.len` is a use of
-                        // `self` that invalidates hoisted raw derivations under
-                        // Stacked Borrows.
-                        unsafe { self.base_ptr().add(l).write(v) };
+                        unsafe { self.base_ptr().add(l).write(value) };
                         self.len = (self.len & HEAP_TAG) | (l + 1);
                     }
-                    // Safety: as above, for the final uninitialized slot; moving
-                    // `value` in consumes it without running its destructor here.
-                    let l = self.raw_len();
-                    unsafe { self.base_ptr().add(l).write(value) };
-                    self.len = (self.len & HEAP_TAG) | (l + 1);
                 }
             }
         } else if new_len < len {
@@ -586,8 +702,8 @@ impl<'a, T, const N: usize> CovariantCow<'a, T, N> {
         let needed = len
             .checked_add(additional)
             .ok_or_else(TryReserveError::capacity_overflow)?;
-        if needed <= len {
-            // `additional == 0`: the borrowed slice is already exactly full.
+        if additional == 0 {
+            // Nothing to reserve; the borrowed slice is already exactly full.
             return Ok(());
         }
         let new_cap = if needed <= N {
@@ -623,7 +739,7 @@ impl<'a, T, const N: usize> CovariantCow<'a, T, N> {
         let needed = len
             .checked_add(additional)
             .ok_or_else(TryReserveError::capacity_overflow)?;
-        if needed <= len {
+        if additional == 0 {
             return Ok(());
         }
         let new_cap = planned_cap::<T, N>(len, needed, true);
@@ -688,10 +804,9 @@ impl<'a, T, const N: usize> CovariantCow<'a, T, N> {
     /// Clone/drop accounting matches `Vec`'s (`extend_with`): for `n >= 1`,
     /// `elem` is cloned into the first `n - 1` slots and the **original** is
     /// moved into the last one, so `T::clone` runs `n - 1` times and the
-    /// original is not dropped during the call. This implementation seeds slot
-    /// 0 with the original and clones *that* slot instead — same counts, with
-    /// the original in a different position (unobservable for a
-    /// value-preserving `Clone`).
+    /// original is not dropped during the call. This is also the clone order:
+    /// a side-effectful or identity-carrying `Clone` sees the same sequence
+    /// and leaves the original in the same slot as `vec![elem; n]`.
     #[must_use]
     #[track_caller]
     pub fn from_elem(elem: T, n: usize) -> Self
@@ -705,37 +820,31 @@ impl<'a, T, const N: usize> CovariantCow<'a, T, N> {
         out.reserve_owned(n);
         #[cfg(feature = "specialization")]
         {
-            // Move the owned `elem` into slot 0, then clone *that* slot for
-            // the rest (exactly `n` values, hence `n` destructors —
-            // `vec![elem; n]` semantics). Under `T: Copy` this is one length
-            // publication plus the O(log n) doubling copies of `spec::bulk`;
-            // the stable path below is the same accounting, element-wise.
+            // Clone into slots `[0, n - 1)` and move the original into the
+            // last one — exactly `Vec`'s `extend_with` order (exactly `n`
+            // values, hence `n` destructors). Under `T: Copy` this is one
+            // length publication plus the O(log n) doubling copies of
+            // `spec::bulk`; the stable path below is the same accounting,
+            // element-wise.
             // Safety: capacity `n` reserved, the cow is owned and empty, and
             // slots `[0, n)` are uninitialized. For a ZST the write consumes
             // `elem` (ZST protocol site 1).
-            unsafe { T::seed_fill(elem, &mut out, n) };
+            unsafe { T::tail_fill(elem, &mut out, 0, n) };
         }
         #[cfg(not(feature = "specialization"))]
         {
-            // Move the owned `elem` into slot 0, then clone *that* slot for the
-            // rest (exactly `n` values, hence `n` destructors — `vec![elem; n]`
-            // semantics). The length writes preserve the heap tag, since `reserve`
-            // may have spilled.
-            let dst0 = out.base_ptr();
-            // Safety: capacity `n` reserved, slot 0 uninitialized. For a ZST this
-            // consumes `elem` (ZST protocol site 1).
-            unsafe { dst0.write(elem) };
-            out.len = (out.len & HEAP_TAG) | 1;
-            for i in 1..n {
-                // Safety: slot 0 is initialized; re-derived each iteration because
-                // the `out.len` write below invalidates a hoisted pointer inline.
-                // (ZST protocol: slot 0 was never written, but reading a ZST through
-                // a `&T` touches no bytes and the clone is counted.)
-                let v = unsafe { (&*out.base_ptr_const()).clone() };
-                // Safety: slot [i] is uninitialized (capacity `n` reserved).
-                unsafe { out.base_ptr().add(i).write(v) };
-                out.len = (out.len & HEAP_TAG) | (i + 1);
-            }
+            // Clone into slots `[0, n - 1)` and move the original into the
+            // last one — exactly `Vec`'s `extend_with` order. `extend_owned`
+            // carries the hoisted heap fast path and publishes after each
+            // clone, so a panic leaves the produced prefix counted and the
+            // in-flight original is dropped by the unwind.
+            out.extend_owned(core::iter::repeat_with(|| elem.clone()).take(n - 1));
+            let l = out.raw_len();
+            // Safety: capacity `n` was reserved, slots `[0, n - 1)` are
+            // initialized, and slot `l == n - 1` is uninitialized. For a ZST
+            // the write consumes `elem` (ZST protocol site 1).
+            unsafe { out.base_ptr().add(l).write(elem) };
+            out.len = (out.len & HEAP_TAG) | (l + 1);
         }
         out
     }
@@ -960,9 +1069,13 @@ impl<'a, T, const N: usize> CovariantCow<'a, T, N> {
     /// `T::clone` once per element for a ZST too (see the `clone_from` note in
     /// this impl), so cloning and then mutating can run more `clone` calls
     /// than `to_mut` on the same borrowed cow. Every *value-consuming* count
-    /// update (`push`/`insert`/`resize`/`extend`) adopts, like `to_mut`;
-    /// `Clone` is the one deliberate exception, because calling `T::clone` is
-    /// its entire contract.
+    /// update (`push`/`insert`/`resize`/`extend`, and `append` with a
+    /// borrowed `other`) adopts, like `to_mut`; `Clone` is the one deliberate
+    /// exception, because calling `T::clone` is its entire contract.
+    ///
+    /// The fallible twin is [`try_to_mut`](Self::try_to_mut): it reports an
+    /// allocation failure or a capacity overflow instead of aborting/panicking,
+    /// and leaves a borrowed cow borrowed.
     #[track_caller]
     pub fn to_mut(&mut self) -> &mut [T]
     where
@@ -1008,6 +1121,36 @@ impl<'a, T, const N: usize> CovariantCow<'a, T, N> {
             }
         }
         self.as_mut_slice()
+    }
+
+    /// Fallible version of [`to_mut`](Self::to_mut).
+    ///
+    /// Ensures uniquely-owned storage, cloning the borrowed data if needed, and
+    /// returns a mutable slice. The clone semantics are exactly `to_mut`'s,
+    /// including the ZST adoption rule (see its documentation).
+    ///
+    /// Unlike `to_mut`, a materialization that cannot be represented as an
+    /// allocation (capacity overflow) or whose `alloc` fails returns
+    /// [`TryReserveError`] instead of panicking/aborting, and the cow is left
+    /// **borrowed and unmodified**. An already-owned cow performs no allocation
+    /// and always succeeds.
+    ///
+    /// A panic inside `T::clone` is recovered exactly as in `to_mut`: the
+    /// already-cloned prefix is owned and the cow stays valid (the state is
+    /// published before cloning starts).
+    ///
+    /// The block is sized exactly `len`, like `to_mut` — not on the amortized
+    /// growth curve — because the caller asked for access, not for room to
+    /// grow. Use [`try_reserve`](Self::try_reserve) to materialize and grow in
+    /// one allocation.
+    pub fn try_to_mut(&mut self) -> Result<&mut [T], TryReserveError>
+    where
+        T: Clone,
+    {
+        if self.is_borrowed() {
+            self.try_materialize(self.raw_len())?;
+        }
+        Ok(self.as_mut_slice())
     }
 
     /// Fallible copy-on-write materialization into a buffer of capacity
@@ -1071,6 +1214,14 @@ impl<'a, T, const N: usize> CovariantCow<'a, T, N> {
     /// the mutation grew again). Allocation failure aborts (via
     /// [`TryReserveError::abort`]), matching the other infallible capacity
     /// methods; capacity overflow panics with `"capacity overflow"`.
+    ///
+    /// The block is sized on the amortized `planned_cap` curve: when
+    /// `2 * len` exceeds `len + additional`, the reservation is up to ~2×
+    /// the required length. That is the same curve `Vec::reserve` uses (and
+    /// `Vec::append`/`extend_from_slice` reserve through it), so a one-shot
+    /// bulk operation over a large borrowed slice may hold ~2× peak memory.
+    /// The `_exact` variants ([`Self::reserve_exact`],
+    /// [`Self::try_reserve_exact`]) size the block exactly.
     ///
     /// Preconditions: borrowed, `additional <= MAX_LEN - raw_len`.
     #[track_caller]
@@ -1516,6 +1667,395 @@ impl<'a, T, const N: usize> CovariantCow<'a, T, N> {
         self.make_drain(begin, end, len)
     }
 
+    // ----------------------------------------------------------------------
+    // Bulk operations
+    // ----------------------------------------------------------------------
+
+    /// Moves all the elements of `other` into `self`, leaving `other` empty.
+    ///
+    /// A **borrowed** `other` is not materialized: its `&'a [T]` is cloned
+    /// directly into `self`, then narrowed to an empty borrow (the
+    /// `truncate(0)` semantics) — costing exactly the clone `self` would
+    /// have paid anyway. When `self` is also borrowed, the copy-on-write and
+    /// the room for `other` are fused into a single allocation by the
+    /// crate's fused materialization helper.
+    ///
+    /// The one exception is a **zero-sized** `T`: the count is the
+    /// ownership, so a borrowed `other` is *adopted* (`self`'s count grows
+    /// by `other_len`) without calling `T::clone`, exactly like
+    /// [`Self::to_mut`]'s ZST materialization. Destructor bookkeeping stays
+    /// balanced; only the `Clone` side effects are skipped.
+    ///
+    /// An **owned** `other` is moved element-wise with no clone (the same
+    /// native path as [`Self::append_owned`]); `self` is materialized first
+    /// if it is borrowed. For a zero-sized element only the counts move.
+    ///
+    /// `other` keeps its storage state and capacity when it is owned (std
+    /// parity); a borrowed `other` stays borrowed but empty.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `"capacity overflow"` if the combined length is not
+    /// representable, and aborts through the allocation-error hook if a
+    /// reservation fails. Both happen before any element moves.
+    #[track_caller]
+    pub fn append(&mut self, other: &mut Self)
+    where
+        T: Clone,
+    {
+        let other_len = other.raw_len();
+        if other_len == 0 {
+            return;
+        }
+        if size_of::<T>() == 0 {
+            // ZST: the count *is* the ownership. Materializing a borrowed
+            // `self` adopts its count without cloning; a borrowed `other` is
+            // narrowed (no drops) and an owned one transfers its count.
+            if self.is_borrowed() {
+                self.to_mut();
+            }
+            if other.is_borrowed() {
+                self.reserve_owned(other_len);
+                // Same tag-hygiene guard as `push_owned`: the untagged length
+                // write below must never run on a heap-backed ZST cow.
+                assert!(!self.is_heap(), "ZST cows are never heap-backed");
+                self.len = self.raw_len() + other_len;
+                other.truncate(0);
+            } else {
+                self.append_owned(other);
+            }
+            return;
+        }
+        if self.is_borrowed() {
+            // Fuse the copy-on-write with the room for `other`: one
+            // allocation even when both sides are borrowed.
+            self.materialize_with_min_capacity(other_len);
+        }
+        if other.is_borrowed() {
+            // Clone the borrowed slice straight into `self` through the
+            // range-fill primitive: one bulk copy for `T: Copy` (the old
+            // `extend_owned(iter().cloned())` could never reach
+            // `memcpy_fill`, which only fills from length 0), the same
+            // per-element clone loop otherwise. The borrow is narrowed only
+            // after every clone succeeded, so a panic inside `T::clone`
+            // leaves `other` intact (with the originals still owned by the
+            // borrower).
+            self.reserve_owned(other_len);
+            let src: &'a [T] = other.as_borrowed().unwrap();
+            let self_len = self.raw_len();
+            // Safety: `self` is owned (materialized above if it was borrowed)
+            // with capacity for `self_len + other_len`; the borrowed slice is
+            // a distinct allocation, valid for `other_len` reads, and its
+            // slots do not overlap `self`'s. Slots
+            // `[self_len, self_len + other_len)` are uninitialized.
+            unsafe { self.fill_range(src.as_ptr(), self_len, other_len) };
+            other.truncate(0);
+        } else {
+            self.append_owned(other);
+        }
+    }
+
+    /// [`Self::append`] on **already-owned** cows, without requiring
+    /// `T: Clone`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either cow is in the borrowed state — call [`Self::to_mut`]
+    /// first, or use [`Self::append`].
+    #[track_caller]
+    pub fn append_owned(&mut self, other: &mut Self) {
+        assert!(
+            !self.is_borrowed(),
+            "append_owned on a borrowed CovariantCow"
+        );
+        assert!(
+            !other.is_borrowed(),
+            "append_owned with a borrowed CovariantCow"
+        );
+        let other_len = other.raw_len();
+        if other_len == 0 {
+            return;
+        }
+        self.reserve_owned(other_len);
+        if size_of::<T>() == 0 {
+            assert!(!self.is_heap(), "ZST cows are never heap-backed");
+            assert!(!other.is_heap(), "ZST cows are never heap-backed");
+            self.len = self.raw_len() + other_len;
+            other.len = 0;
+            return;
+        }
+        let self_len = self.raw_len();
+        // Derived after `reserve_owned` (which may have reallocated).
+        // Safety: capacity for `self_len + other_len` slots; slots
+        // `[self_len, self_len + other_len)` are uninitialized.
+        let dst = unsafe { self.base_ptr().add(self_len) };
+        // Safety: `[0, other_len)` are initialized in `other`'s owned storage.
+        let src = other.base_ptr_const();
+        // Safety: distinct containers, hence distinct storage; bitwise move —
+        // the source slots are retired by the length write below without
+        // running destructors.
+        unsafe { ptr::copy_nonoverlapping(src, dst, other_len) };
+        self.len = (self.len & HEAP_TAG) | (self_len + other_len);
+        other.len &= HEAP_TAG;
+    }
+
+    /// Appends a copy of every element of `other`, like
+    /// [`Vec::extend_from_slice`](alloc::vec::Vec::extend_from_slice), but
+    /// bounded on `T: Copy` so the copy is a single bulk `memcpy` **on
+    /// stable** (no `specialization` feature required).
+    ///
+    /// A borrowed cow is materialized first, with the room for `other` fused
+    /// into the same allocation; an empty `other` is a no-op that leaves a
+    /// borrowed cow borrowed.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `"capacity overflow"` if the combined length is not
+    /// representable, and aborts through the allocation-error hook if the
+    /// reservation fails. Both happen before any element is copied.
+    #[track_caller]
+    pub fn extend_from_slice(&mut self, other: &[T])
+    where
+        T: Copy,
+    {
+        let other_len = other.len();
+        if other_len == 0 {
+            return;
+        }
+        if self.is_borrowed() {
+            // `T: Copy` implies `Clone`, so fuse the copy-on-write and the
+            // room for `other` into one allocation.
+            self.materialize_with_min_capacity(other_len);
+        } else {
+            self.reserve_owned(other_len);
+        }
+        let self_len = self.raw_len();
+        if size_of::<T>() == 0 {
+            // No bytes exist; the count is the ownership. The reserve paths
+            // enforced `MAX_LEN`, and a `Copy` ZST has no destructor to
+            // balance.
+            assert!(!self.is_heap(), "ZST cows are never heap-backed");
+            self.len = self.raw_len() + other_len;
+            return;
+        }
+        // Safety: capacity for `self_len + other_len` slots, so
+        // `[self_len, self_len + other_len)` is in bounds and uninitialized.
+        // `other` cannot overlap this cow's owned storage: a borrowed source
+        // was materialized into a fresh block above, and safe code cannot
+        // hold a `&[T]` into an owned cow's block alongside `&mut self`.
+        unsafe {
+            let dst = self.base_ptr().add(self_len);
+            ptr::copy_nonoverlapping(other.as_ptr(), dst, other_len);
+            self.len = (self.len & HEAP_TAG) | (self_len + other_len);
+        }
+    }
+
+    /// Splits the cow in two at `at`: `self` keeps `[0, at)` and the new
+    /// return value owns `[at, len)`.
+    ///
+    /// For an **owned** cow the result is state-normalized exactly like
+    /// [`Clone`]: a tail that fits the inline buffer is inline (no
+    /// allocation), a longer tail gets a heap block with capacity exactly its
+    /// length. `self` keeps its state and capacity.
+    ///
+    /// For a **borrowed** cow the split is **zero-copy** and needs no
+    /// `T: Clone`: the tail is a borrowed cow over the same `&'a [T]`, and
+    /// `self` is narrowed to the prefix — two disjoint sub-slices of the
+    /// original borrow.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `at > len`.
+    #[track_caller]
+    #[must_use]
+    pub fn split_off(&mut self, at: usize) -> Self {
+        let len = self.raw_len();
+        assert!(
+            at <= len,
+            "`at` split index (is {at}) should be <= len (is {len})"
+        );
+        let tail = len - at;
+        // The borrowed branch comes first so `at == len` still yields a
+        // *borrowed* (empty) tail: `split_at(len)` is a valid split, and a
+        // borrowed cow stays borrowed on both sides for every `at`.
+        if self.is_borrowed() {
+            // Zero-copy: `split_at` yields two disjoint sub-slices of the
+            // same borrow, both with the original `'a`.
+            let b: &'a [T] = unsafe { self.data.borrowed };
+            let (head, tail_slice) = b.split_at(at);
+            self.data.borrowed = head;
+            self.len = BORROWED_TAG | at;
+            return Self::from_borrowed(tail_slice);
+        }
+        let mut out = Self::new();
+        if tail == 0 {
+            return out;
+        }
+        if size_of::<T>() == 0 {
+            // ZST: the count is the ownership; no bytes move and neither
+            // side can be heap-backed.
+            out.len = tail;
+            self.len = at;
+            return out;
+        }
+        if tail > N {
+            // Allocates exactly `tail` before any element moves.
+            out.alloc_heap(tail);
+        }
+        // Safety: `[at, len)` are initialized in `self`'s owned storage.
+        let src = unsafe { self.base_ptr().add(at) };
+        // Safety: `out` owns storage for `tail` slots and is empty.
+        let dst = out.base_ptr();
+        // Safety: distinct containers, hence distinct storage; bitwise move —
+        // the source slots are retired by the length writes below.
+        unsafe { ptr::copy_nonoverlapping(src, dst, tail) };
+        out.len = (out.len & HEAP_TAG) | tail;
+        self.len = (self.len & HEAP_TAG) | at;
+        out
+    }
+
+    /// Replaces the elements of `range` with those produced by
+    /// `replace_with`, returning the removed elements as a [`CowSplice`].
+    ///
+    /// A **borrowed** cow is materialized first (hence the `T: Clone` bound)
+    /// unless the range is empty *and* the replacement **reports** an empty
+    /// upper bound (`size_hint().1 == Some(0)`), in which case the cow stays
+    /// borrowed and the returned `CowSplice` is inert. That shortcut trusts
+    /// the iterator's upper bound. **`size_hint` is not a safety contract,
+    /// and this is the only place the crate relies on it:** a replacement
+    /// that reports zero and then yields an element is a logic error and
+    /// panics when the `CowSplice` is dropped (the `Drop` path deliberately
+    /// carries no `T: Clone` bound, so it cannot materialize lazily). An
+    /// empty range with a replacement that might yield is materialized up
+    /// front: it has to be written into owned storage.
+    ///
+    /// A replacement longer than the range is written in geometrically
+    /// growing chunks (see [`Splice`](crate::Splice)); each chunk reserves
+    /// room, so an inline cow can spill to the heap.
+    ///
+    /// Range validation and leak semantics mirror [`Self::drain`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the range is out of bounds, and — only for a borrowed cow
+    /// with an empty range — if `replace_with` reports an empty upper size
+    /// hint and then yields an element (see above). The latter is a logic
+    /// error in the iterator; no element is moved or dropped by the cow. A
+    /// replacement whose lower size hint is too large to reserve may also
+    /// panic with `"capacity overflow"` while a borrowed cow is materialized,
+    /// before any element is moved.
+    #[track_caller]
+    pub fn splice<R, I>(
+        &mut self,
+        range: R,
+        replace_with: I,
+    ) -> CowSplice<'_, 'a, T, N, I::IntoIter>
+    where
+        R: RangeBounds<usize>,
+        I: IntoIterator<Item = T>,
+        T: Clone,
+    {
+        let len = self.raw_len();
+        let (begin, end) = crate::drain_bounds(&range, len);
+        let replace_with = replace_with.into_iter();
+        if self.is_borrowed() && (begin != end || replace_with.size_hint().1 != Some(0)) {
+            // Fold the replacement's lower size hint into the materialization:
+            // if it may be longer than the hole, reserve the difference now so
+            // phase 2 does not reallocate. This mirrors std's `Splice::drop`,
+            // which sizes its tail move from the same lower bound. A lower
+            // bound that overstates the length only over-reserves; one that
+            // understates it — or a non-fused iterator that ends phase 1
+            // early — may cost one extra reservation in phase 2, never
+            // correctness.
+            let extra = replace_with.size_hint().0.saturating_sub(end - begin);
+            if extra == 0 {
+                // Keep `to_mut`'s exact-`len` allocation when the replacement
+                // fits the hole.
+                self.to_mut();
+            } else {
+                self.materialize_with_min_capacity(extra);
+            }
+        }
+        CowSplice {
+            drain: self.make_drain(begin, end, len),
+            replace_with,
+        }
+    }
+
+    /// [`Self::splice`] on an **already-owned** cow, without requiring
+    /// `T: Clone`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cow is in the borrowed state — call [`Self::to_mut`]
+    /// first, or use [`Self::splice`].
+    #[track_caller]
+    pub fn splice_owned<R, I>(
+        &mut self,
+        range: R,
+        replace_with: I,
+    ) -> CowSplice<'_, 'a, T, N, I::IntoIter>
+    where
+        R: RangeBounds<usize>,
+        I: IntoIterator<Item = T>,
+    {
+        assert!(
+            !self.is_borrowed(),
+            "splice_owned on a borrowed CovariantCow"
+        );
+        let len = self.raw_len();
+        let (begin, end) = crate::drain_bounds(&range, len);
+        CowSplice {
+            drain: self.make_drain(begin, end, len),
+            replace_with: replace_with.into_iter(),
+        }
+    }
+
+    /// Moves out and yields every element `e` for which `f(&mut e)` returns
+    /// `true`, keeping the rest, in order.
+    ///
+    /// Materializes a borrowed cow first (hence the `T: Clone` bound), then
+    /// runs the same in-place backshift scan as
+    /// [`Self::retain_mut`], with matched elements yielded instead of
+    /// dropped. See [`CowExtractIf`] for the scan-state and leak semantics.
+    pub fn extract_if<F>(&mut self, pred: F) -> CowExtractIf<'_, 'a, T, N, F>
+    where
+        T: Clone,
+        F: FnMut(&mut T) -> bool,
+    {
+        if self.is_borrowed() {
+            self.to_mut();
+        }
+        self.extract_if_owned(pred)
+    }
+
+    /// [`Self::extract_if`] on an **already-owned** cow, without requiring
+    /// `T: Clone`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cow is in the borrowed state — call [`Self::to_mut`]
+    /// first, or use [`Self::extract_if`].
+    pub fn extract_if_owned<F>(&mut self, pred: F) -> CowExtractIf<'_, 'a, T, N, F>
+    where
+        F: FnMut(&mut T) -> bool,
+    {
+        assert!(
+            !self.is_borrowed(),
+            "extract_if_owned on a borrowed CovariantCow"
+        );
+        let original_len = self.raw_len();
+        // Owned states have `BORROWED_TAG == 0`; preserve `HEAP_TAG`.
+        self.len &= HEAP_TAG;
+        CowExtractIf {
+            cow: self,
+            pred,
+            idx: 0,
+            del: 0,
+            original_len,
+        }
+    }
+
     /// Retains only the elements specified by the predicate, passing a mutable
     /// reference to each element.
     ///
@@ -1605,9 +2145,10 @@ impl<'a, T, const N: usize> CovariantCow<'a, T, N> {
         );
         if self.is_borrowed() {
             // Materialization reserves room for one more element, so the ZST
-            // HEAP_TAG-collision bound is enforced here by the reserve path;
-            // `push` and the `extend` paths instead carry the explicit
-            // `raw_len < MAX_LEN` assert themselves.
+            // BORROWED_TAG-collision bound (`raw_len` must stay below
+            // `MAX_LEN`, or bit 62 would be set) is enforced here by the
+            // reserve path; `push` and the `extend` paths instead carry the
+            // explicit `raw_len < MAX_LEN` assert themselves.
             self.materialize_with_min_capacity(1);
         }
         self.insert_owned(index, value);
@@ -2074,6 +2615,12 @@ impl<'a, T: Clone, const N: usize> Clone for CovariantCow<'a, T, N> {
         // adopt the count. Contrast `to_mut`, which adopts without cloning;
         // the asymmetry is documented there.
         self.clear();
+        // Match `clone`'s state normalization: a result that fits inline must
+        // be inline, not a reused heap block (see the `CovariantVec` twin).
+        // The length is 0 after `clear`, so this moves no elements.
+        if len <= N {
+            self.shrink_to_inline();
+        }
         // Safety: `src` is valid for `len` reads (`self` is owned here, inline
         // or heap; `base_ptr_const` handles both; ZST offsets are no-ops), and
         // `self` is empty after `clear` with capacity >= `len` (inline `N`,
@@ -2259,9 +2806,22 @@ impl<'a, T, const N: usize> From<Vec<T>> for CovariantCow<'a, T, N> {
             return out;
         }
 
+        // The length field is only 62 bits wide, and `HEAP_TAG | len` sets
+        // `BORROWED_TAG` (bit 62) as soon as `len > MAX_LEN`, making an owned
+        // heap cow look borrowed. This is reachable on 32-bit targets, where
+        // `MAX_LEN` is `2^30 - 1`: a `Vec<u8>` of 1 GiB already exceeds it.
+        // Keep this guard (and the ZST one above) in sync with
+        // `CovariantVec::from(Vec)`; only the bound differs (`MAX_LEN` here,
+        // `isize::MAX` there, because that encoding spends only bit 63).
+        assert!(len <= MAX_LEN, "capacity overflow");
+
         if vec.capacity() > N {
             // Take over the allocation (cap may be <= N only when `N == 0`,
-            // which cannot happen since cap > N).
+            // which cannot happen since cap > N). A capacity above `MAX_LEN`
+            // would also make the cow a trap — `grow_to` clamps to `MAX_LEN`,
+            // so the next `push` would panic despite spare capacity — and
+            // every other entry point rejects it; keep the invariant uniform.
+            assert!(vec.capacity() <= MAX_LEN, "capacity overflow");
             let mut v = ManuallyDrop::new(vec);
             let ptr = v.as_mut_ptr();
             CovariantCow {
@@ -2303,6 +2863,10 @@ impl<'a, T, const N: usize, const M: usize> From<[T; M]> for CovariantCow<'a, T,
 // Iteration / collection traits
 // --------------------------------------------------------------------------
 
+/// Extending a **borrowed** cow materializes it on the amortized growth curve,
+/// so peak capacity can be up to ~2× the final length. For exact sizing, call
+/// [`reserve_exact`](Self::reserve_exact) with the iterator's lower bound and
+/// then [`extend_owned`](Self::extend_owned).
 impl<'a, T: Clone, const N: usize> Extend<T> for CovariantCow<'a, T, N> {
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
         // Owned: no peek and no split reservation — `extend_owned` reserves the
@@ -2433,8 +2997,9 @@ impl<'a, T, const N: usize> CowIntoIter<'a, T, N> {
     #[must_use]
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         let n = self.tail - self.head;
-        // Safety: [head, tail) are initialized; `&mut self` excludes aliases.
-        unsafe { slice::from_raw_parts_mut(self.cow.base_ptr().add(self.head), n) }
+        // Safety: [head, tail) are initialized; `&mut self` excludes aliases,
+        // and the iterator's constructor materialized the cow (owned state).
+        unsafe { slice::from_raw_parts_mut(self.cow.base_ptr_owned().add(self.head), n) }
     }
 
     /// Drops the not-yet-consumed elements `[head, tail)` and frees the heap
@@ -2450,7 +3015,8 @@ impl<'a, T, const N: usize> CowIntoIter<'a, T, N> {
             // Safety: [head, tail) are still initialized and unused. ZST
             // protocol (site 2): for a ZST these slots were never written, but
             // the drop glue touches no bytes and runs once per counted element.
-            let p = unsafe { self.cow.base_ptr().add(self.head) };
+            // Safety: owned state (the constructor materializes).
+            let p = unsafe { self.cow.base_ptr_owned().add(self.head) };
             unsafe { ptr::drop_in_place(ptr::slice_from_raw_parts_mut(p, remaining)) };
         }
         if self.cow.is_heap() {
@@ -2472,10 +3038,14 @@ impl<'a, T, const N: usize> Iterator for CowIntoIter<'a, T, N> {
         if self.head >= self.tail {
             return None;
         }
-        // Safety: slot [head] is initialized.
-        let p = unsafe { self.cow.base_ptr().add(self.head) };
-        self.head += 1;
-        Some(unsafe { p.read() })
+        let idx = self.head;
+        self.head = idx + 1;
+        // Safety: slot [idx] is initialized. The pointer is derived *after*
+        // the cursor write (the two share this iterator's allocation in the
+        // inline state) so the ordering never relies on Stacked Borrows'
+        // per-location granularity; `next_back` already works this way.
+        // Safety: owned state (the constructor materializes).
+        Some(unsafe { self.cow.base_ptr_owned().add(idx).read() })
     }
 
     #[inline]
@@ -2493,7 +3063,8 @@ impl<'a, T, const N: usize> DoubleEndedIterator for CowIntoIter<'a, T, N> {
         }
         self.tail -= 1;
         // Safety: slot [tail] is initialized.
-        let p = unsafe { self.cow.base_ptr().add(self.tail) };
+        // Safety: owned state (the constructor materializes).
+        let p = unsafe { self.cow.base_ptr_owned().add(self.tail) };
         Some(unsafe { p.read() })
     }
 }
@@ -2581,8 +3152,9 @@ impl<'r, 'a, T, const N: usize> CowDrain<'r, 'a, T, N> {
     #[must_use]
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         let n = self.back - self.pos;
-        // Safety: as `as_slice`, plus `&mut self` excludes aliases.
-        unsafe { slice::from_raw_parts_mut(self.cow.base_ptr().add(self.pos), n) }
+        // Safety: as `as_slice`, plus `&mut self` excludes aliases, and the
+        // drain constructor materialized the cow (owned state).
+        unsafe { slice::from_raw_parts_mut(self.cow.base_ptr_owned().add(self.pos), n) }
     }
 
     /// Keeps every not-yet-yielded element in the container, so only the
@@ -2630,6 +3202,11 @@ impl<'r, 'a, T, const N: usize> CowDrain<'r, 'a, T, N> {
             back: self.back,
         };
         drop(rb);
+        // The rollback moved the cow back into the caller's slot, so
+        // `self.cow` is a taken `ManuallyDrop`. `as_slice`/`as_mut_slice` are
+        // still callable after `keep_rest`; give them a valid empty cow
+        // instead of a moved-out value.
+        self.cow = ManuallyDrop::new(CovariantCow::new());
         // The container is back in the caller's slot; `Drop` must do nothing,
         // and the kept elements count as consumed, so the iterator is now
         // exhausted.
@@ -2660,7 +3237,8 @@ impl<'r, 'a, T, const N: usize> CowDrain<'r, 'a, T, N> {
             // element not yet yielded. (`pos` advances before the drop only for
             // this loop's bookkeeping — `CowDrainRollback` does not read `pos`,
             // so the ordering is not load-bearing for the unwind path.)
-            let p = unsafe { rb.cow.base_ptr().add(rb.pos) };
+            // Safety: owned state (the drain constructor materializes).
+            let p = unsafe { rb.cow.base_ptr_owned().add(rb.pos) };
             rb.pos += 1;
             unsafe { ptr::drop_in_place(p) };
         }
@@ -2696,8 +3274,12 @@ impl<T, const N: usize> Drop for CowDrainRollback<'_, '_, T, N> {
                 );
             }
             let c = &mut **self.cow;
-            // Preserve the tag bits (owned states have `BORROWED_TAG == 0`).
-            c.len = (c.len & HEAP_TAG) | (self.original_len - (self.end - self.begin));
+            // Safety: exactly `original_len - (end - begin)` leading slots are
+            // initialized (kept prefix + shifted tail); this only shrinks, the
+            // cow is owned (the drain constructor materializes), and `set_len`
+            // preserves the state tag while its debug assertion pins the
+            // capacity bound.
+            unsafe { c.set_len(self.original_len - (self.end - self.begin)) };
         }
         if self.cow.is_heap() {
             // Heap state: write back only `(ptr, cap)` + the tagged length,
@@ -2733,11 +3315,12 @@ impl<'r, 'a, T, const N: usize> Iterator for CowDrain<'r, 'a, T, N> {
         }
         // Safety: slot `pos` is initialized and not yet yielded; its slot
         // becomes dead and is overwritten by the rollback without re-dropping.
-        unsafe {
-            let p = self.cow.base_ptr().add(self.pos);
-            self.pos += 1;
-            Some(p.read())
-        }
+        // The pointer is derived after the cursor write, matching
+        // `CowIntoIter::next`.
+        let idx = self.pos;
+        self.pos = idx + 1;
+        // Safety: owned state (the constructor materializes).
+        Some(unsafe { self.cow.base_ptr_owned().add(idx).read() })
     }
 
     #[inline]
@@ -2754,9 +3337,10 @@ impl<'r, 'a, T, const N: usize> DoubleEndedIterator for CowDrain<'r, 'a, T, N> {
             return None;
         }
         self.back -= 1;
-        // Safety: as in `next`.
+        // Safety: as in `next`; the pointer is derived after the cursor write,
+        // and the state is owned (the constructor materializes).
         unsafe {
-            let p = self.cow.base_ptr().add(self.back);
+            let p = self.cow.base_ptr_owned().add(self.back);
             Some(p.read())
         }
     }
@@ -2822,5 +3406,386 @@ impl<'a, T, const N: usize> crate::BackshiftTarget for CovariantCow<'a, T, N> {
     unsafe fn backshift_set_len(&mut self, n: usize) {
         // Preserve both tag bits (owned states have `BORROWED_TAG == 0`).
         self.len = (self.len & !LEN_MASK) | n;
+    }
+}
+
+// --------------------------------------------------------------------------
+// CowSplice
+// --------------------------------------------------------------------------
+
+/// A splicing iterator over a [`CovariantCow`].
+///
+/// Created by [`CovariantCow::splice`] / [`CovariantCow::splice_owned`].
+/// Yields the removed elements (via [`CowDrain`]) as the iterator is
+/// consumed; when the `CowSplice` is dropped, the not-yet-yielded removed
+/// elements are dropped and the replacement is spliced in before the
+/// [`CowDrain`] rolls the cow back. The mechanics — including the in-place
+/// refill of the drained region, the chunked growth for a longer
+/// replacement, and the panic behavior — are identical to the two-state
+/// [`Splice`](crate::Splice); the only difference is that the container is a
+/// three-state cow and is always owned while a non-empty `CowSplice` exists
+/// (a borrowed cow is materialized at construction). Like `Splice`, a
+/// replacement longer than the range may reallocate, so an inline cow can
+/// spill to the heap. An empty-range `CowSplice` leaves a borrowed cow
+/// borrowed when the replacement reported an empty upper size hint, so its
+/// insert path expects the iterator to stay empty.
+///
+/// # Panics
+///
+/// A panic from a removed element's destructor follows [`CowDrain`]'s
+/// unwind path (the remaining removed elements are reclaimed without running
+/// their destructors). A panic from the replacement iterator keeps every
+/// replacement element already written and rolls the tail back over only the
+/// still-dead remainder — std's behavior. On the empty-range borrowed path, a
+/// replacement that reports an empty upper size hint but then yields panics
+/// with `"splice replacement yielded an element after reporting an empty size
+/// hint"`; the cow is left unchanged. The replacement is driven from `Drop`,
+/// so any of these panics aborts if the `CowSplice` is itself being dropped
+/// during unwinding (std parity).
+///
+/// # Leaking
+///
+/// Forgetting a non-empty `CowSplice` leaks the whole cow (like forgetting a
+/// [`CowDrain`]); an **empty** range never takes the cow, so forgetting it
+/// leaks nothing.
+pub struct CowSplice<'r, 'a, T, const N: usize, I: Iterator<Item = T>> {
+    drain: CowDrain<'r, 'a, T, N>,
+    replace_with: I,
+}
+
+impl<'r, 'a, T, const N: usize, I: Iterator<Item = T>> Iterator for CowSplice<'r, 'a, T, N, I> {
+    type Item = T;
+
+    #[inline]
+    fn next(&mut self) -> Option<T> {
+        self.drain.next()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.drain.size_hint()
+    }
+}
+
+impl<'r, 'a, T, const N: usize, I: Iterator<Item = T>> FusedIterator
+    for CowSplice<'r, 'a, T, N, I>
+{
+}
+
+impl<'r, 'a, T: fmt::Debug, const N: usize, I: Iterator<Item = T>> fmt::Debug
+    for CowSplice<'r, 'a, T, N, I>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("CowSplice")
+            .field(&self.drain.as_slice())
+            .finish()
+    }
+}
+
+/// Fill guard for [`CowSplice`]: the cow twin of `SpliceFill`, tracking the
+/// dead gap while the replacement is written and compacting it — publishing
+/// the final length — when it drops, on the normal path *and* during
+/// unwinding.
+///
+/// The cow lives in `drain.cow` for a non-empty splice and in `drain.slot`
+/// for an empty-range splice (which never takes the cow), so every accessor
+/// dispatches on `drain.owns`. Only owned cows reach this guard: the
+/// borrowed empty-range shortcut is handled separately by `drop_impl`.
+struct CowSpliceFill<'f, 'r, 'a, T, const N: usize> {
+    drain: &'f mut CowDrain<'r, 'a, T, N>,
+}
+
+impl<'f, 'r, 'a, T, const N: usize> CowSpliceFill<'f, 'r, 'a, T, N> {
+    /// The cow being filled (always owned).
+    #[inline]
+    fn cow(&mut self) -> &mut CovariantCow<'a, T, N> {
+        if self.drain.owns {
+            &mut self.drain.cow
+        } else {
+            &mut *self.drain.slot
+        }
+    }
+
+    /// Reserves room for `additional` more slots.
+    #[inline]
+    fn reserve(&mut self, additional: usize) {
+        self.cow().reserve_owned(additional);
+    }
+
+    /// Shifts the live tail right by `slots`, growing the dead gap at
+    /// `begin` by that many slots, and publishes the grown length.
+    ///
+    /// # Safety
+    ///
+    /// Capacity for `original_len + slots` slots; `slots >= 1`.
+    unsafe fn open_gap(&mut self, slots: usize) {
+        let end = self.drain.end;
+        let original_len = self.drain.original_len;
+        // Safety: `[end, original_len)` is the live tail and
+        // `[end + slots, original_len + slots)` is spare capacity. `ptr::copy`
+        // handles the overlap (the destination is to the right).
+        unsafe {
+            let base = self.cow().base_ptr_owned();
+            ptr::copy(base.add(end), base.add(end + slots), original_len - end);
+        }
+        self.drain.end = end + slots;
+        self.drain.original_len = original_len + slots;
+        // Publish the grown length now (see `SpliceFill::open_gap`): the next
+        // chunk's `reserve_owned` sizes from the cow's own length, and the
+        // shifted tail must lie inside it. The guard closes the dead gap
+        // before the cow is observable again, including on the unwind path.
+        //
+        // Safety: slots `[0, original_len + slots)` are initialized; the cow
+        // is owned and `set_len` preserves the state tag.
+        unsafe { self.cow().set_len(original_len + slots) };
+    }
+
+    /// Writes `x` into the dead gap at `begin` and advances the gap start.
+    ///
+    /// # Safety
+    ///
+    /// `begin < end`; the slot is dead.
+    unsafe fn write(&mut self, x: T) {
+        let at = self.drain.begin;
+        // Re-derive the base per write (Stacked Borrows, as in `SpliceFill`).
+        // Safety: `at < end <= original_len <= capacity` and the slot is dead.
+        unsafe {
+            let base = self.cow().base_ptr_owned();
+            base.add(at).write(x);
+        }
+        self.drain.begin = at + 1;
+    }
+}
+
+impl<T, const N: usize> Drop for CowSpliceFill<'_, '_, '_, T, N> {
+    fn drop(&mut self) {
+        if self.drain.begin != self.drain.end {
+            // The replacement ended before the gap closed (an exhausted
+            // zero-hint iterator, a lying lower bound, or a non-fused
+            // iterator). Compact the live tail over the dead remainder.
+            let begin = self.drain.begin;
+            let end = self.drain.end;
+            let tail = self.drain.original_len - end;
+            // Safety: `[end, original_len)` is the live tail and
+            // `[begin, begin + tail)` lies at or before it (`begin < end`), so
+            // `ptr::copy` handles the overlap.
+            unsafe {
+                let base = self.cow().base_ptr_owned();
+                ptr::copy(base.add(end), base.add(begin), tail);
+            }
+            self.drain.end = begin;
+            self.drain.original_len = begin + tail;
+        }
+        let len = self.drain.original_len;
+        // Safety: `[0, len)` is initialized and `len <= capacity`; the cow is
+        // owned, and `set_len` preserves the state tag.
+        unsafe { self.cow().set_len(len) };
+    }
+}
+
+impl<'r, 'a, T, const N: usize, I: Iterator<Item = T>> CowSplice<'r, 'a, T, N, I> {
+    /// Shared `Drop` body; mirrors [`Splice`](crate::Splice)'s
+    /// `drop_impl` with the cow's `CowDrain` geometry.
+    fn drop_impl(&mut self) {
+        // Drop the not-yet-yielded removed elements first.
+        while self.drain.next().is_some() {}
+        if !self.drain.owns && self.drain.slot.is_borrowed() {
+            // Empty range on a borrowed cow: the constructor's upper-hint
+            // shortcut left it borrowed, and `Drop` has no `T: Clone` to
+            // materialize it. An honest replacement is empty, so the loop
+            // runs zero times; a replacement that yields is a logic error,
+            // named here rather than failing `insert_owned`'s generic
+            // assertion.
+            for (j, x) in self.replace_with.by_ref().enumerate() {
+                assert!(
+                    !self.drain.slot.is_borrowed(),
+                    "splice replacement yielded an element after reporting an empty size hint"
+                );
+                self.drain.slot.insert_owned(self.drain.begin + j, x);
+            }
+            return;
+        }
+
+        {
+            let mut fill = CowSpliceFill {
+                drain: &mut self.drain,
+            };
+            // Phase 1: refill the dead hole in place. Advance `begin` after
+            // each write so a panic keeps the written prefix and leaves the
+            // rollback a correct geometry (see `Splice::drop_impl` for the
+            // full argument).
+            while fill.drain.begin < fill.drain.end {
+                match self.replace_with.next() {
+                    Some(x) => {
+                        // Safety: `begin < end`, so the slot is in the dead
+                        // gap.
+                        unsafe { fill.write(x) };
+                    }
+                    None => break,
+                }
+            }
+
+            // Phase 2: the cow twin of `Splice::drop_impl`'s chunked growth —
+            // one reserve, one tail shift, and one fill per chunk, with the
+            // chunk size doubling for zero-lower-bound iterators.
+            let mut chunk = crate::SPLICE_CHUNK;
+            'grow: loop {
+                // Pull before opening a gap so an exhausted iterator costs no
+                // shift (and a lying huge hint is never consulted).
+                let Some(x) = self.replace_with.next() else {
+                    break;
+                };
+                let (lower, upper) = self.replace_with.size_hint();
+                let mut slots = chunk.max(lower.saturating_add(1));
+                if let Some(upper) = upper {
+                    slots = slots.min(upper.saturating_add(1));
+                }
+                // Panics (capacity overflow / allocation failure) happen
+                // before any geometry change, so the guard sees the phase-1
+                // state; `x` is dropped by the unwind.
+                fill.reserve(slots);
+                // Safety: capacity for `original_len + slots`; `slots >= 1`.
+                unsafe { fill.open_gap(slots) };
+                // Safety: the gap is open and `slots >= 1`.
+                unsafe { fill.write(x) };
+                while fill.drain.begin < fill.drain.end {
+                    match self.replace_with.next() {
+                        Some(x) => {
+                            // Safety: `begin < end`.
+                            unsafe { fill.write(x) };
+                        }
+                        None => break 'grow,
+                    }
+                }
+                chunk = chunk.saturating_mul(2);
+            }
+        }
+        // The guard has compacted the gap and published the length; the
+        // `CowDrain` rollback now takes its empty-range skip and hands the
+        // cow back.
+        self.drain.pos = self.drain.begin;
+        self.drain.back = self.drain.begin;
+    }
+}
+
+// Same drop obligations as `CowDrain`: the body moves raw bytes, drops
+// *owned* removed elements, and never reads any `T` nor anything reachable
+// through `'a` (the replacement is moved in, not cloned).
+#[cfg(feature = "dropck_eyepatch")]
+unsafe impl<'r, #[may_dangle] 'a, #[may_dangle] T, const N: usize, I: Iterator<Item = T>> Drop
+    for CowSplice<'r, 'a, T, N, I>
+{
+    fn drop(&mut self) {
+        self.drop_impl();
+    }
+}
+
+#[cfg(not(feature = "dropck_eyepatch"))]
+impl<'r, 'a, T, const N: usize, I: Iterator<Item = T>> Drop for CowSplice<'r, 'a, T, N, I> {
+    fn drop(&mut self) {
+        self.drop_impl();
+    }
+}
+
+// --------------------------------------------------------------------------
+// CowExtractIf
+// --------------------------------------------------------------------------
+
+/// An iterator that moves the matching elements out of a [`CovariantCow`]
+/// according to a predicate, keeping the rest in their original order.
+///
+/// Created by [`CovariantCow::extract_if`] /
+/// [`CovariantCow::extract_if_owned`]. The scan is the same in-place
+/// backshift scan as [`ExtractIf`](crate::ExtractIf); a borrowed cow is
+/// materialized at construction, so the rollback only ever sees owned storage.
+/// The length is published as `0` for the scan's duration (forget → safe
+/// leak, never double-drop), and dropping the iterator early — normally or
+/// while unwinding — compacts the untouched tail and restores the length.
+pub struct CowExtractIf<'r, 'a, T, const N: usize, F> {
+    cow: &'r mut CovariantCow<'a, T, N>,
+    pred: F,
+    /// Index of the next slot to examine, in the *original* coordinates.
+    idx: usize,
+    /// Number of elements moved out so far: `[idx - del, idx)` are dead holes.
+    del: usize,
+    /// Length of the cow when the scan started.
+    original_len: usize,
+}
+
+impl<'r, 'a, T, const N: usize, F> Iterator for CowExtractIf<'r, 'a, T, N, F>
+where
+    F: FnMut(&mut T) -> bool,
+{
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        // One derivation per call (the predicate reborrows the storage, and
+        // this loop performs no other cow access) — the same per-location
+        // discipline as `ExtractIf::next`.
+        let base = self.cow.base_ptr();
+        while self.idx < self.original_len {
+            // Safety: `idx < original_len <= capacity`; slot `idx` is in
+            // the untouched, initialized tail.
+            let cur = unsafe { base.add(self.idx) };
+            if (self.pred)(unsafe { &mut *cur }) {
+                // Safety: initialized and not yet processed; the value is
+                // moved out and its slot becomes a dead hole counted by
+                // `del` (ZST protocol site 3).
+                let out = unsafe { ptr::read(cur) };
+                self.idx += 1;
+                self.del += 1;
+                return Some(out);
+            }
+            if self.del > 0 {
+                // Safety: distinct slots in the same buffer (`hole < cur`).
+                unsafe { ptr::copy_nonoverlapping(cur, base.add(self.idx - self.del), 1) };
+            }
+            self.idx += 1;
+        }
+        None
+    }
+}
+
+impl<'r, 'a, T, const N: usize, F> CowExtractIf<'r, 'a, T, N, F> {
+    /// Shared `Drop` body: compacts the untouched tail over the dead holes
+    /// and restores the length through the cow's `BackshiftTarget` impl
+    /// (which preserves both tag bits). It runs no destructor, so it cannot
+    /// panic, and it runs on the normal *and* the unwinding path.
+    fn rollback(&mut self) {
+        if self.idx < self.original_len && self.del > 0 {
+            // Safety: `[idx, original_len)` is the untouched, initialized
+            // tail; `[idx - del, idx)` is dead. `ptr::copy` handles overlap.
+            unsafe {
+                let base = self.cow.backshift_base();
+                ptr::copy(
+                    base.add(self.idx),
+                    base.add(self.idx - self.del),
+                    self.original_len - self.idx,
+                );
+            }
+        }
+        // Safety: exactly `original_len - del` leading slots are initialized
+        // (retained prefix + compacted tail); this only shrinks, and the
+        // setter preserves the state tags.
+        unsafe { self.cow.backshift_set_len(self.original_len - self.del) };
+    }
+}
+
+// The drop body shifts raw bytes and fixes the length; it never reads any `T`
+// nor anything reachable through `'a` (the predicate is not called on this
+// path), so the same `#[may_dangle]` annotations as `CowDrain` apply.
+#[cfg(feature = "dropck_eyepatch")]
+unsafe impl<'r, #[may_dangle] 'a, #[may_dangle] T, const N: usize, F> Drop
+    for CowExtractIf<'r, 'a, T, N, F>
+{
+    fn drop(&mut self) {
+        self.rollback();
+    }
+}
+
+#[cfg(not(feature = "dropck_eyepatch"))]
+impl<'r, 'a, T, const N: usize, F> Drop for CowExtractIf<'r, 'a, T, N, F> {
+    fn drop(&mut self) {
+        self.rollback();
     }
 }

@@ -27,6 +27,8 @@ static COPY_CLONES: AtomicUsize = AtomicUsize::new(0);
 /// concurrently on separate threads would pollute each other's tallies.
 static COUNT_LOCK: Mutex<()> = Mutex::new(());
 static NONCOPY_CLONES: AtomicUsize = AtomicUsize::new(0);
+static ZST_CLONES: AtomicUsize = AtomicUsize::new(0);
+static ZST_DROPS: AtomicUsize = AtomicUsize::new(0);
 
 /// `Copy`, but with an observable `Clone`.
 ///
@@ -60,6 +62,25 @@ impl Clone for NoDropNotCopy {
     fn clone(&self) -> Self {
         NONCOPY_CLONES.fetch_add(1, Ordering::SeqCst);
         NoDropNotCopy(self.0)
+    }
+}
+
+/// A zero-sized `!Copy` type with both an observable `Clone` and a real
+/// destructor. Under `specialization` it must take the *default*
+/// `CloneRepeat` impls; their ZST accounting (the count is the ownership) is
+/// easy to get wrong and is not pinned by the `()`/`CopyCounter` cases.
+struct ZstTracked;
+
+impl Clone for ZstTracked {
+    fn clone(&self) -> Self {
+        ZST_CLONES.fetch_add(1, Ordering::SeqCst);
+        ZstTracked
+    }
+}
+
+impl Drop for ZstTracked {
+    fn drop(&mut self) {
+        ZST_DROPS.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -357,6 +378,42 @@ fn vec_resize_grow_copy_clone_counts() {
     } else {
         assert_eq!(calls, 2, "stable must run the element-wise loop");
     }
+}
+
+/// `!Copy` ZST through the *default* `tail_fill`: the bulk path must not
+/// engage, and the count-as-ownership accounting must match `vec![elem; n]`
+/// (n - 1 clones, n destructors) in both configurations.
+#[test]
+fn vec_from_elem_noncopy_zst_accounting() {
+    let _count_guard = COUNT_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    ZST_CLONES.store(0, Ordering::SeqCst);
+    ZST_DROPS.store(0, Ordering::SeqCst);
+    let v = CovariantVec::<ZstTracked, 4>::from_elem(ZstTracked, 5);
+    assert_eq!(v.len(), 5);
+    assert!(!v.is_heap());
+    assert_eq!(ZST_CLONES.load(Ordering::SeqCst), 4);
+    assert_eq!(ZST_DROPS.load(Ordering::SeqCst), 0);
+    drop(v);
+    assert_eq!(ZST_DROPS.load(Ordering::SeqCst), 5);
+}
+
+/// `!Copy` ZST through the *default* `tail_fill` (the `specialization`
+/// `resize` path): `additional - 1` clones, the original moved into the
+/// last slot, and exactly `new_len` destructors overall.
+#[test]
+fn vec_resize_noncopy_zst_accounting() {
+    let _count_guard = COUNT_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    ZST_CLONES.store(0, Ordering::SeqCst);
+    ZST_DROPS.store(0, Ordering::SeqCst);
+    let mut v = CovariantVec::<ZstTracked, 4>::new();
+    v.push(ZstTracked);
+    assert_eq!(ZST_DROPS.load(Ordering::SeqCst), 0);
+    v.resize(6, ZstTracked);
+    assert_eq!(v.len(), 6);
+    assert_eq!(ZST_CLONES.load(Ordering::SeqCst), 4);
+    assert_eq!(ZST_DROPS.load(Ordering::SeqCst), 0);
+    drop(v);
+    assert_eq!(ZST_DROPS.load(Ordering::SeqCst), 6);
 }
 
 #[cfg(feature = "cow")]

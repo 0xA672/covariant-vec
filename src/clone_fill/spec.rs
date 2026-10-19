@@ -1,4 +1,4 @@
-//! The `T: Copy` specialization pair — the only `default fn` in the crate.
+//! The `T: Copy` specialization pair — the only `default fn`s in the crate.
 //!
 //! This file is compiled **only** when the nightly `specialization` cargo
 //! feature is on (see the `#[cfg]`-gated `mod spec;` in `clone_fill.rs`).
@@ -30,35 +30,51 @@ use core::ptr;
 
 use super::{elementwise, CloneFill, CloneSink};
 
-/// The `memcpy` path: one bulk copy, then a single length publication.
+/// The `memcpy` path: one bulk copy into `[start, start + len)`, then a
+/// single length publication.
 ///
 /// Neither `ptr::copy_nonoverlapping` nor `publish_len` can panic, so there is
 /// no partially-filled window to recover from, and no need for the
 /// per-element publication the element-wise loop performs.
 #[inline]
-unsafe fn memcpy_fill<T: Copy, C: CloneSink<Elem = T>>(src: *const T, dest: &mut C, len: usize) {
+unsafe fn memcpy_fill<T: Copy, C: CloneSink<Elem = T>>(
+    src: *const T,
+    dest: &mut C,
+    start: usize,
+    len: usize,
+) {
     // Safety: `dest` is owned (caller contract).
-    let dst = unsafe { dest.raw_base() };
+    let dst = unsafe { dest.raw_base().add(start) };
     // Safety: `src` is valid for `len` reads and `dst` for `len` writes, and
     // the two do not overlap (caller contract). `raw_base` is derived exactly
     // once: nothing touches `dest` between here and the single `publish_len`,
     // so there is nothing to re-derive under Stacked Borrows.
     unsafe { ptr::copy_nonoverlapping(src, dst, len) };
-    // Safety: slots `[0, len)` are initialized.
-    unsafe { dest.publish_len(len) };
+    // Safety: slots `[0, start + len)` are initialized.
+    unsafe { dest.publish_len(start + len) };
 }
 
 impl<T: Clone, C: CloneSink<Elem = T>> CloneFill<C> for T {
     default unsafe fn clone_fill(src: *const T, dest: &mut C, len: usize) {
         // Safety: forwarded from the caller.
-        unsafe { elementwise(src, dest, len) }
+        unsafe { elementwise(src, dest, 0, len) }
+    }
+
+    default unsafe fn clone_fill_range(src: *const T, dest: &mut C, start: usize, len: usize) {
+        // Safety: forwarded from the caller.
+        unsafe { elementwise(src, dest, start, len) }
     }
 }
 
 impl<T: Copy, C: CloneSink<Elem = T>> CloneFill<C> for T {
     unsafe fn clone_fill(src: *const T, dest: &mut C, len: usize) {
         // Safety: forwarded from the caller.
-        unsafe { memcpy_fill(src, dest, len) }
+        unsafe { memcpy_fill(src, dest, 0, len) }
+    }
+
+    unsafe fn clone_fill_range(src: *const T, dest: &mut C, start: usize, len: usize) {
+        // Safety: forwarded from the caller.
+        unsafe { memcpy_fill(src, dest, start, len) }
     }
 }
 
@@ -66,34 +82,23 @@ impl<T: Copy, C: CloneSink<Elem = T>> CloneFill<C> for T {
 /// `resize`-grow appends), as opposed to [`CloneFill`], which copies each
 /// element from a distinct source slot.
 ///
-/// Two shapes, because the two call sites pin different (equally
-/// std-parity) accounting contracts:
+/// [`CloneRepeat::tail_fill`] clones the value into the first `len - 1`
+/// new slots and moves it into the last. That is exactly `Vec`'s
+/// `extend_with`/`resize` shape — `len - 1` clones, no extra destructor,
+/// and the original in the last slot — so `from_elem` and `resize` share
+/// one shape with identical std parity (including the clone call order for a
+/// non-value-preserving `Clone`).
 ///
-/// * [`CloneRepeat::seed_fill`] — move the value into slot 0, clone *that*
-///   slot for the rest: `from_elem`/`vec![elem; n]` semantics (exactly `n`
-///   values, `n - 1` clones, `n` destructors).
-/// * [`CloneRepeat::tail_fill`] — clone the value into the first
-///   `len - 1` new slots and move it into the last: `Vec::resize` semantics
-///   (also `len - 1` clones, no extra destructor).
-///
-/// Under `T: Copy` both collapse to one length publication plus `bulk`'s
+/// Under `T: Copy` it collapses to one length publication plus `bulk`'s
 /// O(log len) doubling `copy_nonoverlapping` calls (≈2× write amplification —
 /// the only true single-memcpy path is `CloneFill`'s `memcpy_fill`) — sound
 /// because no user code runs between the copies and the publication (nothing
 /// can observe a partially-filled buffer or panic), and for a type with no
 /// destructor "moved original" vs "last copy" is unobservable.
 pub(crate) trait CloneRepeat<C: CloneSink> {
-    /// Fills `dest[0, len)` with `len` copies of `elem`, moving `elem` into
-    /// slot 0 (`from_elem` semantics).
-    ///
-    /// # Safety
-    ///
-    /// `dest` must be owned with published length 0, capacity `>= len`, and
-    /// slots `[0, len)` uninitialized.
-    unsafe fn seed_fill(elem: Self, dest: &mut C, len: usize);
-
     /// Fills `dest[start, start + len)` with `len` copies of `elem`, moving
-    /// `elem` into slot `start + len - 1` (`Vec::resize` semantics).
+    /// `elem` into slot `start + len - 1` (`Vec::resize`/`vec![elem; n]`
+    /// semantics).
     ///
     /// # Safety
     ///
@@ -141,32 +146,7 @@ unsafe fn bulk<T: Copy, C: CloneSink<Elem = T>>(elem: &T, dest: &mut C, start: u
 }
 
 impl<T: Clone, C: CloneSink<Elem = T>> CloneRepeat<C> for T {
-    default unsafe fn seed_fill(elem: T, dest: &mut C, len: usize) {
-        if len == 0 {
-            return;
-        }
-        // Move into slot 0.
-        // Safety: slot 0 is uninitialized (caller contract).
-        unsafe { dest.raw_base().write(elem) };
-        // Safety: slot 0 is initialized.
-        unsafe { dest.publish_len(1) };
-        for i in 1..len {
-            // Clone the seed slot. The base is re-derived each iteration on
-            // purpose: the publication below is a use of `dest` that
-            // invalidates a hoisted pointer in the inline state (Stacked
-            // Borrows, same discipline as `elementwise`).
-            let v = {
-                // Safety: slot 0 is initialized.
-                let seed = unsafe { dest.raw_base() };
-                unsafe { (&*seed).clone() }
-            };
-            // Safety: slot `i` is uninitialized (caller contract).
-            unsafe { dest.raw_base().add(i).write(v) };
-            // Safety: slots `[0, i + 1)` are initialized.
-            unsafe { dest.publish_len(i + 1) };
-        }
-    }
-
+    #[inline]
     default unsafe fn tail_fill(elem: T, dest: &mut C, start: usize, len: usize) {
         if len == 0 {
             return;
@@ -189,14 +169,7 @@ impl<T: Clone, C: CloneSink<Elem = T>> CloneRepeat<C> for T {
 }
 
 impl<T: Copy, C: CloneSink<Elem = T>> CloneRepeat<C> for T {
-    unsafe fn seed_fill(elem: T, dest: &mut C, len: usize) {
-        if len == 0 {
-            return;
-        }
-        // Safety: forwarded from the caller.
-        unsafe { bulk(&elem, dest, 0, len) };
-    }
-
+    #[inline]
     unsafe fn tail_fill(elem: T, dest: &mut C, start: usize, len: usize) {
         if len == 0 {
             return;

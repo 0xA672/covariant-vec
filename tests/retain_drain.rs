@@ -326,6 +326,105 @@ fn drain_start_out_of_bounds_panics() {
     let _ = v.drain(5..);
 }
 
+/// std validates the end bound before the start, so an end past `len` wins
+/// over a start past `len`: `drain(5..6)` reports the end index.
+#[test]
+#[should_panic(expected = "range end index 6 out of range for slice of length 3")]
+fn drain_end_bound_checked_before_start() {
+    let mut v = CovariantVec::<i32, 4>::new();
+    v.extend([1, 2, 3]);
+    let _ = v.drain(5..6);
+}
+
+/// An empty range with an end past `len` is still an end-bound error (the
+/// start is not consulted first).
+#[test]
+#[should_panic(expected = "range end index 4 out of range for slice of length 3")]
+fn drain_empty_range_with_end_past_len_reports_end() {
+    let mut v = CovariantVec::<i32, 4>::new();
+    v.extend([1, 2, 3]);
+    let _ = v.drain(4..4);
+}
+
+/// An inclusive end at `len` reports the **inclusive** index, not `i + 1`.
+#[test]
+#[should_panic(expected = "range end index 3 out of range for slice of length 3")]
+fn drain_inclusive_end_at_len_reports_inclusive_index() {
+    let mut v = CovariantVec::<i32, 4>::new();
+    v.extend([1, 2, 3]);
+    let _ = v.drain(..=3);
+}
+
+/// std's `StartPastEnd` for an `Excluded` start equal to the end falls
+/// through to the inclusive-end fallback; pin that quirk too.
+#[test]
+#[should_panic(expected = "range end index 2 out of range for slice of length 3")]
+fn drain_excluded_start_equal_end_reports_end() {
+    use std::ops::Bound::Excluded;
+    let mut v = CovariantVec::<i32, 4>::new();
+    v.extend([1, 2, 3]);
+    let _ = v.drain((Excluded(2), Excluded(2)));
+}
+
+/// Differential parity check: every range below must panic with exactly the
+/// same message as `std::vec::Vec::drain` (or not panic at all). The table
+/// covers the end-before-start order, the inclusive-end index, saturating
+/// `usize::MAX` bounds, and the `Excluded`-start fallback.
+#[test]
+#[allow(clippy::reversed_empty_ranges)] // the reversed ranges are the point
+fn drain_bounds_messages_match_std() {
+    fn msg<F: FnOnce()>(f: F) -> String {
+        match catch_unwind(AssertUnwindSafe(f)) {
+            Ok(()) => String::new(),
+            Err(e) => e
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| e.downcast_ref::<String>().cloned())
+                .unwrap_or_default(),
+        }
+    }
+
+    macro_rules! check {
+        ($($range:expr),* $(,)?) => {$(
+            let std_msg = msg(|| {
+                let mut v = vec![0, 1, 2];
+                let _ = v.drain($range);
+            });
+            let crate_msg = msg(|| {
+                let mut v = CovariantVec::<i32, 4>::new();
+                v.extend([0, 1, 2]);
+                let _ = v.drain($range);
+            });
+            assert_eq!(std_msg, crate_msg, "range {}", stringify!($range));
+        )*};
+    }
+
+    check!(
+        5..6,
+        7..2,
+        4..4,
+        2..1,
+        2..5,
+        ..=3,
+        ..=usize::MAX,
+        usize::MAX..,
+        usize::MAX..usize::MAX,
+        3..,
+        ..4,
+    );
+
+    use std::ops::Bound::{Excluded, Included, Unbounded};
+    check!(
+        (Excluded(2), Excluded(2)),
+        (Excluded(2), Excluded(1)),
+        (Excluded(3), Excluded(3)),
+        (Excluded(usize::MAX), Unbounded),
+        (Included(usize::MAX), Unbounded),
+        (Included(3), Excluded(3)),
+        (Included(4), Excluded(3)),
+    );
+}
+
 /// This test exists to make the *reason* for the move-out `Drain` design a
 /// compile-visible artifact. It asserts the user-observable consequence that a
 /// borrowed implementation could not provide: `mem::forget(drain)` leaves the
@@ -614,6 +713,10 @@ fn drain_keep_rest_keeps_unyielded() {
     assert_eq!(d.next(), Some(2)); // yielded: the caller owns it now
     d.keep_rest(); // keeps 3 and 4, removes only the yielded 2
     assert_eq!(d.len(), 0); // nothing left to yield
+                            // The moved-out container was replaced by a fresh empty one, so the
+                            // slice accessors remain valid after `keep_rest`.
+    assert!(d.as_slice().is_empty());
+    assert!(d.as_mut_slice().is_empty());
     drop(d); // must be a no-op after `keep_rest`
     assert_eq!(&*v, &[1, 3, 4, 5, 6]);
     assert_eq!(v.len(), 5);

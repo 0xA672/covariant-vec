@@ -52,6 +52,69 @@ fn to_mut_materializes_heap() {
 }
 
 #[test]
+fn try_to_mut_materializes_inline() {
+    let data = [10, 20, 30];
+    let mut c = CovariantCow::<i32, 4>::from_borrowed(&data);
+    assert!(c.is_borrowed());
+
+    c.try_to_mut().unwrap()[0] = 99;
+    assert!(!c.is_borrowed());
+    assert!(!c.is_heap());
+    assert_eq!(&*c, &[99, 20, 30]);
+    // The borrowed source is untouched (copy-on-write).
+    assert_eq!(data, [10, 20, 30]);
+}
+
+#[test]
+fn try_to_mut_materializes_heap_exactly() {
+    let data: Vec<i32> = (0..10).collect();
+    let mut c = CovariantCow::<i32, 2>::from_borrowed(&data);
+    assert!(c.is_borrowed());
+
+    c.try_to_mut().unwrap()[0] = 99;
+    assert!(c.is_heap());
+    // Exactly `len`, like `to_mut` — not the amortized growth curve.
+    assert_eq!(c.capacity(), 10);
+    assert_eq!(c[0], 99);
+    assert_eq!(c[9], 9);
+    assert_eq!(data[0], 0);
+}
+
+#[test]
+fn try_to_mut_owned_is_a_noop() {
+    let mut c = CovariantCow::<i32, 4>::new();
+    c.extend_owned(0..6);
+    assert!(c.is_heap());
+    let ptr = c.as_ptr();
+    let cap = c.capacity();
+
+    c.try_to_mut().unwrap()[0] = 42;
+    assert_eq!(c.as_ptr(), ptr, "an owned cow must not reallocate");
+    assert_eq!(c.capacity(), cap);
+    assert_eq!(c[0], 42);
+}
+
+struct NoCloneZst;
+impl Clone for NoCloneZst {
+    fn clone(&self) -> Self {
+        panic!("try_to_mut must adopt a ZST count, not clone");
+    }
+}
+
+#[test]
+fn try_to_mut_zst_adopts_count_without_cloning() {
+    // Same ZST adoption rule as `to_mut`; the panicking `Clone` proves the
+    // count is transferred rather than cloned.
+    let data = [NoCloneZst, NoCloneZst, NoCloneZst];
+    let mut c = CovariantCow::<NoCloneZst, 2>::from_borrowed(&data);
+    assert!(c.is_borrowed());
+
+    assert_eq!(c.try_to_mut().unwrap().len(), 3);
+    assert!(!c.is_borrowed());
+    assert_eq!(c.len(), 3);
+}
+
+#[test]
 fn push_after_borrow() {
     let data = [1, 2, 3];
     let mut c = CovariantCow::<i32, 4>::from_borrowed(&data);
@@ -85,6 +148,7 @@ fn clear_and_clone() {
     assert!(c.is_borrowed());
     assert!(c.is_empty());
     assert_eq!(&*c, &[]);
+    assert_eq!(c.as_borrowed().unwrap().as_ptr(), data.as_ptr());
     assert_eq!(d.len(), 3);
 }
 
@@ -197,6 +261,41 @@ fn to_mut_is_panic_safe_heap() {
     drop(c); // frees the partially-filled heap block, no leak/UB
 }
 
+/// `try_materialize` (the fallible `try_reserve*` path) publishes a valid
+/// empty owned state *before* cloning, so a panicking `Clone` leaves exactly
+/// the cloned prefix counted in both the inline and heap branches.
+#[test]
+fn try_materialize_is_panic_safe_inline() {
+    let ctr = Arc::new(AtomicUsize::new(0));
+    let data = make_data(3, &ctr, 1);
+    let mut c = CovariantCow::<PanicClone, 4>::from_borrowed(&data);
+
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        let _ = c.try_reserve(1);
+    }));
+    assert!(r.is_err());
+    assert!(!c.is_borrowed());
+    assert!(!c.is_heap());
+    assert_eq!(c.len(), 1);
+    drop(c);
+}
+
+#[test]
+fn try_materialize_is_panic_safe_heap() {
+    let ctr = Arc::new(AtomicUsize::new(0));
+    let data = make_data(10, &ctr, 3);
+    let mut c = CovariantCow::<PanicClone, 2>::from_borrowed(&data);
+
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        let _ = c.try_reserve(1);
+    }));
+    assert!(r.is_err());
+    assert!(!c.is_borrowed());
+    assert!(c.is_heap());
+    assert_eq!(c.len(), 3);
+    drop(c);
+}
+
 // --------------------------------------------------------------------------
 // Ordering / hashing forwarding
 // --------------------------------------------------------------------------
@@ -214,6 +313,51 @@ fn ord_and_hash() {
     let mut h2 = DefaultHasher::new();
     CovariantCow::<i32, 4>::from_borrowed(&a_src).hash(&mut h2);
     assert_eq!(h1.finish(), h2.finish());
+}
+
+#[test]
+fn eq_hash_ord_are_state_independent() {
+    fn hash_of<T: Hash, const N: usize>(c: &CovariantCow<'_, T, N>) -> u64 {
+        let mut h = DefaultHasher::new();
+        c.hash(&mut h);
+        h.finish()
+    }
+
+    let data = [1, 2, 3];
+    let borrowed = CovariantCow::<i32, 4>::from_borrowed(&data);
+
+    let mut inline = CovariantCow::<i32, 4>::new();
+    inline.extend_owned([1, 2, 3]);
+    assert!(!inline.is_heap());
+
+    // Same `N`: `PartialEq`/`Ord` are only implemented between cows of the
+    // same const-generic width, so force the heap state with an up-front
+    // capacity instead.
+    let mut heap = CovariantCow::<i32, 4>::with_capacity(8);
+    heap.extend_owned([1, 2, 3]);
+    assert!(heap.is_heap());
+
+    // Equality is over the contents, never the state tag or storage class.
+    assert_eq!(borrowed, inline);
+    assert_eq!(borrowed, heap);
+    assert_eq!(inline, heap);
+
+    // Hashing must agree across states, or the same logical key would land in
+    // a different HashMap bucket depending on how the cow was produced.
+    assert_eq!(hash_of(&borrowed), hash_of(&inline));
+    assert_eq!(hash_of(&borrowed), hash_of(&heap));
+
+    // Ordering is likewise state-blind, in both directions. The `>=` pair
+    // exercises the comparison operators themselves, not just `cmp`.
+    assert_eq!(borrowed.cmp(&inline), core::cmp::Ordering::Equal);
+    assert_eq!(borrowed.cmp(&heap), core::cmp::Ordering::Equal);
+    assert!(borrowed >= inline && inline >= borrowed);
+
+    let smaller = CovariantCow::<i32, 4>::from_borrowed(&[1, 2]);
+    let mut bigger = CovariantCow::<i32, 4>::new();
+    bigger.extend_owned([1, 2, 3]);
+    assert!(smaller < bigger);
+    assert_eq!(bigger.cmp(&smaller), core::cmp::Ordering::Greater);
 }
 
 // --------------------------------------------------------------------------
@@ -288,6 +432,14 @@ fn into_vec_from_cow() {
     c.push_owned(2);
     let v: Vec<i32> = c.into();
     assert_eq!(v, vec![1, 2]);
+
+    // ZST: only the count moves out.
+    let mut c = CovariantCow::<(), 4>::new();
+    for _ in 0..10 {
+        c.push(());
+    }
+    let v: Vec<()> = c.into();
+    assert_eq!(v.len(), 10);
 }
 
 // --------------------------------------------------------------------------
@@ -306,6 +458,12 @@ fn from_vec_owned() {
     let c = CovariantCow::<i32, 4>::from(big);
     assert!(c.is_heap());
     assert_eq!(&*c, &[1, 2, 3]);
+
+    // ZST: the count is the ownership; no storage is taken over.
+    let c = CovariantCow::<(), 4>::from(vec![(); 10]);
+    assert_eq!(c.len(), 10);
+    assert!(!c.is_borrowed());
+    assert!(!c.is_heap());
 
     // `From<&[T]>` must not require `T: Clone` — exercised by construction.
     let data = [1, 2, 3];
@@ -406,6 +564,7 @@ fn resize_shrink_borrowed_does_not_clone() {
     assert!(c.is_borrowed());
     assert_eq!(c.len(), 3);
     assert_eq!(ctr.load(Ordering::SeqCst), 0); // 1000 clones avoided
+    assert_eq!(c.as_borrowed().unwrap().as_ptr(), data.as_ptr());
     assert_eq!(c[0].val, 0);
     assert_eq!(c[2].val, 2);
 }
@@ -687,6 +846,15 @@ fn extend_empty_on_borrowed_does_not_materialize() {
     assert!(c.is_borrowed()); // not materialized
     assert_eq!(ctr.load(Ordering::SeqCst), 0); // no clones
     assert_eq!(c.len(), 5);
+
+    // The `T: Copy` by-reference impl has the same peek: an empty iterator
+    // must not force a materialization either.
+    let data = [1i32, 2, 3];
+    let mut c = CovariantCow::<i32, 4>::from_borrowed(&data);
+    c.extend(core::iter::empty::<&i32>());
+    assert!(c.is_borrowed());
+    assert_eq!(&*c, &data);
+    assert_eq!(c.as_borrowed().unwrap().as_ptr(), data.as_ptr());
 }
 
 // --------------------------------------------------------------------------
@@ -799,9 +967,10 @@ fn cow_try_reserve_owned_on_borrowed_panics() {
 #[test]
 fn cow_try_reserve_zst_bounds() {
     use covariant_vec::TryReserveErrorKind;
-    // The cow spends bit 62 on the borrowed tag, so its ZST length bound is
-    // `2^62 - 1` rather than `isize::MAX`.
-    let bound = (1usize << 62) - 1;
+    // The cow spends the top two bits on tags, so its ZST length bound is
+    // `2^(BITS-2) - 1` rather than `isize::MAX` (`2^62 - 1` on 64-bit,
+    // `2^30 - 1` on 32-bit).
+    let bound = (1usize << (usize::BITS - 2)) - 1;
     let mut c: CovariantCow<(), 4> = CovariantCow::with_capacity(0);
     assert!(c.try_reserve(bound).is_ok());
     assert_eq!(
@@ -813,9 +982,9 @@ fn cow_try_reserve_zst_bounds() {
 #[test]
 #[should_panic(expected = "capacity overflow")]
 fn cow_zst_with_capacity_too_large_panics() {
-    // Symmetric with `reserve_owned`: a ZST request above the 62-bit length
+    // Symmetric with `reserve_owned`: a ZST request above the tagged length
     // bound is rejected rather than silently accepted.
-    let _ = CovariantCow::<(), 4>::with_capacity(1usize << 62);
+    let _ = CovariantCow::<(), 4>::with_capacity(1usize << (usize::BITS - 2));
 }
 
 #[test]
@@ -1021,6 +1190,157 @@ fn cow_clone_panic_safety_heap() {
     assert_eq!(src.len(), 5);
     drop(src);
     assert_eq!(drop_ctr.load(Ordering::SeqCst), 8); // frees the partial heap block
+}
+
+/// The cow's stable `from_elem` heap fast path publishes the count after
+/// every clone; a panicking `Clone` leaves the successful clones live and
+/// drops the in-flight original once during unwinding.
+#[test]
+fn cow_from_elem_heap_panicking_clone_drops_are_balanced() {
+    let clone_ctr = Arc::new(AtomicUsize::new(0));
+    let drop_ctr = Arc::new(AtomicUsize::new(0));
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        let _ = CovariantCow::<CowCloneBomb, 2>::from_elem(bomb(0, &clone_ctr, &drop_ctr, 2), 10);
+    }));
+    assert!(r.is_err());
+    assert_eq!(clone_ctr.load(Ordering::SeqCst), 3); // 0,1 ok; 2 panicked
+    assert_eq!(drop_ctr.load(Ordering::SeqCst), 3); // two clones + the in-flight original
+}
+
+static ZBOMB_CLONES: AtomicUsize = AtomicUsize::new(0);
+static ZBOMB_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+/// ZST whose `Clone` panics on its second call and whose `Drop` is counted:
+/// the only way to observe the count/ownership balance for a zero-sized type.
+struct ZBomb;
+
+impl Clone for ZBomb {
+    fn clone(&self) -> Self {
+        if ZBOMB_CLONES.fetch_add(1, Ordering::SeqCst) == 1 {
+            panic!("zst clone boom");
+        }
+        ZBomb
+    }
+}
+
+impl Drop for ZBomb {
+    fn drop(&mut self) {
+        ZBOMB_DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Regression: the ZST grow path must clone *before* bumping the count. A
+/// panic inside `T::clone` used to leave the count claiming one more value
+/// than existed, so `Drop` ran one spurious destructor.
+#[test]
+fn cow_resize_zst_panicking_clone_keeps_count_balanced() {
+    ZBOMB_CLONES.store(0, Ordering::SeqCst);
+    ZBOMB_DROPS.store(0, Ordering::SeqCst);
+    let mut c = CovariantCow::<ZBomb, 4>::new();
+    c.push_owned(ZBomb); // count 1
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        c.resize(4, ZBomb); // additional 3: two clones; the second panics
+    }));
+    assert!(r.is_err());
+    // One existing value + the one successful clone. (The bug left this at 3.)
+    assert_eq!(c.len(), 2);
+    // The in-flight original was dropped by the unwind.
+    assert_eq!(ZBOMB_DROPS.load(Ordering::SeqCst), 1);
+    drop(c);
+    // Exactly the three values ever created (existing + clone + original).
+    assert_eq!(ZBOMB_DROPS.load(Ordering::SeqCst), 3);
+}
+
+/// Heap twin of the `resize` panic tests: the cow's hoisted heap branch must
+/// publish after each clone, so a panic leaves exactly the written prefix (and
+/// the in-flight `value` drops once during unwinding).
+#[test]
+fn cow_resize_heap_panicking_clone_keeps_prefix() {
+    let clone_ctr = Arc::new(AtomicUsize::new(0));
+    let drop_ctr = Arc::new(AtomicUsize::new(0));
+    let mut c: CovariantCow<CowCloneBomb, 2> =
+        (0..6).map(|i| bomb(i, &clone_ctr, &drop_ctr, 2)).collect();
+    assert!(c.is_heap());
+
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        c.resize(10, bomb(99, &clone_ctr, &drop_ctr, 2));
+    }));
+    assert!(r.is_err());
+    assert_eq!(c.len(), 8); // 6 originals + 2 clones
+    assert_eq!(
+        c.iter().map(|t| t.val).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3, 4, 5, 99, 99]
+    );
+    assert_eq!(clone_ctr.load(Ordering::SeqCst), 3); // 0,1 ok; 2 panicked
+    assert_eq!(drop_ctr.load(Ordering::SeqCst), 1); // the in-flight value
+    drop(c);
+    assert_eq!(drop_ctr.load(Ordering::SeqCst), 9);
+}
+
+#[test]
+fn cow_resize_with_panicking_closure_inline_keeps_prefix() {
+    // Twin of the vec's `resize_with_panicking_closure_drop_accounting`: the
+    // cow's `extend_owned` publishes after each produced element, so a panic
+    // in the closure leaves exactly the prefix counted — inline storage.
+    let clone_ctr = Arc::new(AtomicUsize::new(0));
+    let drop_ctr = Arc::new(AtomicUsize::new(0));
+    let mut c: CovariantCow<CowCloneBomb, 4> = CovariantCow::new();
+    for i in 0..3 {
+        c.push_owned(bomb(i, &clone_ctr, &drop_ctr, usize::MAX));
+    }
+    assert!(!c.is_heap());
+
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        let mut k = 0;
+        c.resize_with(6, || {
+            k += 1;
+            if k == 2 {
+                panic!("intentional resize_with panic");
+            }
+            bomb(100 + k, &clone_ctr, &drop_ctr, usize::MAX)
+        });
+    }));
+    assert!(r.is_err());
+    assert_eq!(c.len(), 4); // 3 originals + the one produced before the panic
+    assert_eq!(
+        c.iter().map(|t| t.val).collect::<Vec<_>>(),
+        vec![0, 1, 2, 101]
+    );
+    assert_eq!(drop_ctr.load(Ordering::SeqCst), 0);
+    drop(c);
+    assert_eq!(drop_ctr.load(Ordering::SeqCst), 4); // each live element once
+}
+
+#[test]
+fn cow_resize_with_panicking_closure_heap_keeps_prefix() {
+    // Heap twin: the hoisted fast path must still publish after every write.
+    let clone_ctr = Arc::new(AtomicUsize::new(0));
+    let drop_ctr = Arc::new(AtomicUsize::new(0));
+    let mut c: CovariantCow<CowCloneBomb, 2> = CovariantCow::new();
+    for i in 0..8 {
+        c.push_owned(bomb(i, &clone_ctr, &drop_ctr, usize::MAX));
+    }
+    assert!(c.is_heap());
+
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        let mut k = 0;
+        c.resize_with(12, || {
+            k += 1;
+            if k == 3 {
+                panic!("intentional resize_with panic");
+            }
+            bomb(100 + k, &clone_ctr, &drop_ctr, usize::MAX)
+        });
+    }));
+    assert!(r.is_err());
+    assert_eq!(c.len(), 10);
+    assert_eq!(
+        c.iter().map(|t| t.val).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3, 4, 5, 6, 7, 101, 102]
+    );
+    assert_eq!(drop_ctr.load(Ordering::SeqCst), 0);
+    drop(c);
+    assert_eq!(drop_ctr.load(Ordering::SeqCst), 10);
 }
 
 // --------------------------------------------------------------------------
@@ -1671,6 +1991,32 @@ fn cow_drain_as_mut_slice() {
 }
 
 #[test]
+fn cow_from_elem_matches_std_clone_order() {
+    static NEXT: AtomicUsize = AtomicUsize::new(2000);
+    #[derive(Debug)]
+    struct Ident(usize);
+    impl Clone for Ident {
+        fn clone(&self) -> Self {
+            Ident(NEXT.fetch_add(1, Ordering::SeqCst))
+        }
+    }
+
+    NEXT.store(2000, Ordering::SeqCst);
+    let c = CovariantCow::<Ident, 4>::from_elem(Ident(7), 4);
+    assert_eq!(
+        c.iter().map(|x| x.0).collect::<Vec<_>>(),
+        vec![2000, 2001, 2002, 7]
+    );
+
+    NEXT.store(2000, Ordering::SeqCst);
+    let std_v = vec![Ident(7); 4];
+    assert_eq!(
+        std_v.iter().map(|x| x.0).collect::<Vec<_>>(),
+        vec![2000, 2001, 2002, 7]
+    );
+}
+
+#[test]
 fn cow_from_elem_resize_with_from_array() {
     let c = CovariantCow::<i32, 4>::from_elem(5, 3);
     assert!(!c.is_borrowed());
@@ -1699,13 +2045,31 @@ fn cow_from_elem_resize_with_from_array() {
 fn cow_from_vec_zst_overflow_panics() {
     // The cow's length bound is `MAX_LEN = 2^62 - 1` (tighter than the
     // two-state type's `isize::MAX`), because it spends bit 62 on the borrowed
-    // tag. A ZST `Vec` length past it must be rejected.
+    // tag. A ZST `Vec` length past it must be rejected. Do not swap `()` for a
+    // `Drop`-ful ZST: the bogus count would turn a regression into a ~2^63
+    // iteration destructor loop (a hang), not a clean panic.
     let mut v: Vec<()> = Vec::new();
-    let bogus_len = isize::MAX as usize + 1; // 2^63 on 64-bit, 2^31 on 32-bit: exceeds MAX_LEN either way
-                                             // Safety: `()` is a ZST, so the length is representable and no bytes exist.
+    // 2^63 on 64-bit, 2^31 on 32-bit: exceeds `MAX_LEN` either way.
+    let bogus_len = isize::MAX as usize + 1;
+    // Safety: `()` is a ZST, so the length is representable and no bytes exist.
     unsafe { v.set_len(bogus_len) };
     let r = catch_unwind(AssertUnwindSafe(|| {
         let _ = CovariantCow::<(), 4>::from(v);
+    }));
+    assert!(r.is_err());
+}
+
+/// The non-ZST **capacity** guard is only reachable on 32-bit, where
+/// `MAX_LEN = 2^30 - 1`: a 1 GiB allocation exceeds it even with `len == 0`.
+/// (The length guard is covered on every target by
+/// `cow_from_vec_zst_overflow_panics`.)
+#[cfg(target_pointer_width = "32")]
+#[test]
+fn cow_from_vec_capacity_above_max_len_panics_on_32_bit() {
+    let v: Vec<u8> = Vec::with_capacity(1 << 30);
+    assert!(v.capacity() > (1 << 30) - 1);
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        let _ = CovariantCow::<u8, 4>::from(v);
     }));
     assert!(r.is_err());
 }
@@ -1849,18 +2213,21 @@ fn cow_drain_keep_rest_keeps_unyielded_inline() {
     let mut d = c.drain_owned(1..3); // [2, 3]
     assert_eq!(d.next(), Some(2)); // caller-owned
     d.keep_rest();
+    // The moved-out cow was replaced by a fresh empty one, so the slice
+    // accessors remain valid after `keep_rest`.
+    assert!(d.as_slice().is_empty());
+    assert!(d.as_mut_slice().is_empty());
     drop(d);
     assert_eq!(&*c, &[1, 3]);
     assert!(!c.is_borrowed());
 }
 
 /// Inline-state twin of `cow_drain_drop_accounting`, with drop glue: the
-/// elements live inside the `CowDrain` struct, so `next` derives a slot
-/// pointer into the drain's own allocation and only then bumps `pos`. Sound —
-/// borrow stacks are per-location, and the cursor is byte-disjoint from the
-/// container — but inline-only, so this pins the inline `next` read and
-/// `CowDrain::drop`'s per-element drop loop under Miri, with exact drop
-/// accounting.
+/// elements live inside the `CowDrain` struct, so a slot pointer and the
+/// cursor share one allocation. `next` advances the cursor before deriving
+/// the pointer, the conservative order under either aliasing model; the path
+/// is inline-only, so this pins the inline `next` read and `CowDrain::drop`'s
+/// per-element drop loop under Miri, with exact drop accounting.
 #[test]
 fn cow_drain_inline_non_zst_next_and_drop_loop_accounting() {
     let ctr = Arc::new(AtomicUsize::new(0));
@@ -1947,6 +2314,24 @@ fn cow_drain_keep_rest_nothing_yielded_is_a_full_keep() {
 }
 
 #[test]
+fn cow_drain_keep_rest_after_next_back_only() {
+    // `next_back` advances `back` but leaves `pos == begin`, so `keep_rest`
+    // must skip the shift-back (nothing was yielded from the front) while
+    // still moving the untouched tail over the drained region.
+    let mut c = CovariantCow::<i32, 4>::new();
+    c.extend_owned([1, 2, 3, 4, 5, 6]);
+    assert!(c.is_heap());
+    let cap = c.capacity();
+    let mut d = c.drain_owned(1..5); // [2, 3, 4, 5]
+    assert_eq!(d.next_back(), Some(5));
+    d.keep_rest(); // unyielded: 2, 3, 4
+    drop(d);
+    assert!(c.is_heap());
+    assert_eq!(c.capacity(), cap);
+    assert_eq!(&*c, &[1, 2, 3, 4, 6]);
+}
+
+#[test]
 fn cow_drain_keep_rest_drop_accounting() {
     let ctr = Arc::new(AtomicUsize::new(0));
     let mut c: CovariantCow<CowTracked, 4> = (0..6)
@@ -1995,6 +2380,25 @@ fn cow_clone_from_reuses_destination_capacity() {
     assert_eq!(vals, vec![1009, 1010, 1011]); // clones: `val` shifted by 1000
     assert_eq!(drops.load(Ordering::SeqCst), 8);
     assert_eq!(clones.load(Ordering::SeqCst), 3);
+}
+
+/// The cow twin: `clone_from` must match `clone`'s normalization when the
+/// source fits inline, even if the destination already owns a heap block.
+#[test]
+fn cow_clone_from_small_source_normalizes_heap_destination_to_inline() {
+    let mut dest: CovariantCow<i32, 4> = (0..10).collect();
+    assert!(dest.is_heap());
+    let src: CovariantCow<i32, 4> = (0..2).collect();
+    assert!(!src.is_heap());
+
+    dest.clone_from(&src);
+    let normalized = src.clone();
+    assert_eq!(&*dest, &[0, 1]);
+    assert!(!dest.is_borrowed());
+    assert!(!dest.is_heap());
+    assert_eq!(dest.is_heap(), normalized.is_heap());
+    assert_eq!(dest.capacity(), normalized.capacity());
+    assert_eq!(dest.capacity(), 4);
 }
 
 #[test]

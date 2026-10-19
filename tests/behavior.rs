@@ -2,42 +2,15 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use covariant_vec::CovariantVec;
 
-// --------------------------------------------------------------------------
-// A drop-accounting element type.
-// --------------------------------------------------------------------------
+mod common;
 
-#[derive(Clone, Debug)]
-struct Tracked {
-    counter: Arc<AtomicUsize>,
-    val: i32,
-}
-
-impl PartialEq for Tracked {
-    fn eq(&self, other: &Self) -> bool {
-        self.val == other.val
-    }
-}
-impl Eq for Tracked {}
-
-impl Tracked {
-    fn new(counter: &Arc<AtomicUsize>, val: i32) -> Self {
-        Tracked {
-            counter: Arc::clone(counter),
-            val,
-        }
-    }
-}
-
-impl Drop for Tracked {
-    fn drop(&mut self) {
-        self.counter.fetch_add(1, Ordering::SeqCst);
-    }
-}
+use common::Tracked;
 
 // --------------------------------------------------------------------------
 // Basic inline behaviour
@@ -160,7 +133,7 @@ fn insert_remove_swap_remove() {
 }
 
 #[test]
-#[should_panic]
+#[should_panic(expected = "insertion index (is 5) should be <= len (is 1)")]
 fn insert_out_of_bounds_panics() {
     let mut v = CovariantVec::<i32, 4>::new();
     v.push(1);
@@ -236,12 +209,13 @@ fn drop_partially_consumed_into_iter() {
 }
 
 /// Inline twin of `drop_partially_consumed_into_iter`: with `len <= N` the
-/// elements live *inside* the iterator (`ManuallyDrop<CovariantVec>`), so
-/// `next`/`next_back` derive a slot pointer into the iterator's own allocation
-/// and only *then* write the cursor field. That is sound — borrow stacks are
-/// per-location, and the cursor is byte-disjoint from the container, so the
-/// write does not pop the pointer's tag — but the paths are inline-only, so
-/// this test pins them under Miri (the heap-state tests never reach them).
+/// elements live *inside* the iterator (`ManuallyDrop<CovariantVec>`), so a
+/// slot pointer and the cursor share one allocation. Both `next` and
+/// `next_back` advance the cursor *before* deriving the pointer: that is the
+/// conservative order under any aliasing model (Stacked Borrows stacks are
+/// per-location, so a disjoint-field write would not actually pop the tag, but
+/// the code does not rely on that). The paths are inline-only, so this test
+/// pins them under Miri (the heap-state tests never reach them).
 #[test]
 fn into_iter_inline_non_zst_both_ends_and_drop_remaining() {
     let c = Arc::new(AtomicUsize::new(0));
@@ -269,14 +243,17 @@ fn into_iter_inline_non_zst_both_ends_and_drop_remaining() {
 
 #[test]
 fn zst_never_spills() {
+    // The invariant is stateless, so the long run buys nothing beyond Miri
+    // time: keep the loop small under the interpreter.
+    const ITERS: usize = if cfg!(miri) { 1_000 } else { 100_000 };
     let mut v = CovariantVec::<(), 4>::new();
-    for _ in 0..100_000 {
+    for _ in 0..ITERS {
         v.push(());
     }
-    assert_eq!(v.len(), 100_000);
+    assert_eq!(v.len(), ITERS);
     assert!(!v.is_heap());
     assert_eq!(v.pop(), Some(()));
-    assert_eq!(v.len(), 99_999);
+    assert_eq!(v.len(), ITERS - 1);
     v.clear();
     assert!(v.is_empty());
 }
@@ -419,7 +396,9 @@ fn into_vec_zst() {
 #[allow(clippy::uninit_vec)] // the whole point is a bogus ZST length
 fn from_vec_zst_len_overflow_panics() {
     // A ZST `Vec` can have an arbitrarily large length; `From<Vec>` must
-    // reject a length that would pollute `HEAP_TAG`.
+    // reject a length that would pollute `HEAP_TAG`. Do not swap `()` for a
+    // `Drop`-ful ZST here: the bogus length would turn a regression into a
+    // ~2^63-iteration destructor loop (a hang), not a clean panic.
     let mut v: Vec<()> = Vec::new();
     // The smallest length that exceeds the container's bound, computed
     // portably (`isize::MAX + 1` is `2^63` on 64-bit, `2^31` on 32-bit).
@@ -499,6 +478,73 @@ fn set_len_shrink() {
     assert_eq!(v[0], 1);
     assert_eq!(v.pop(), Some(1));
     assert_eq!(v.pop(), None);
+}
+
+#[test]
+fn set_len_grow_and_shrink() {
+    // The cow has the same test; the vec path is the two-state tag write.
+    let mut v = CovariantVec::<i32, 4>::new();
+    v.extend([1, 2, 3]);
+    // Grow: the caller initializes the new slots before publishing them.
+    unsafe {
+        v.as_mut_ptr().add(3).write(4);
+        v.set_len(4);
+    }
+    assert_eq!(&*v, &[1, 2, 3, 4]);
+    // Shrink: the removed slots are `Copy`, so nothing needs dropping.
+    unsafe { v.set_len(2) };
+    assert_eq!(&*v, &[1, 2]);
+    assert_eq!(v.capacity(), 4); // capacity is preserved
+}
+
+struct DropBomb {
+    panic_at: usize,
+    drops: Arc<AtomicUsize>,
+}
+
+impl Drop for DropBomb {
+    fn drop(&mut self) {
+        let n = self.drops.fetch_add(1, Ordering::SeqCst);
+        if n == self.panic_at {
+            panic!("intentional drop panic");
+        }
+    }
+}
+
+#[test]
+fn heap_drop_panicking_destructor_drops_each_element_once() {
+    // A panic in an element's destructor skips the container's `dealloc`
+    // (the block leaks — std `Vec` parity), but the slice drop glue's unwind
+    // path still drops the remaining elements, so every element is destroyed
+    // exactly once (verified against std with a standalone probe). The block
+    // is reclaimed manually below so LeakSanitizer/ASan stay clean; the
+    // property under test is the destructor accounting, not the leak.
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut v = CovariantVec::<DropBomb, 2>::new();
+    for _ in 0..4 {
+        v.push(DropBomb {
+            panic_at: 2,
+            drops: Arc::clone(&drops),
+        });
+    }
+    assert!(v.is_heap());
+    let ptr = v.as_ptr();
+    let cap = v.capacity();
+    let r = catch_unwind(AssertUnwindSafe(|| drop(v)));
+    assert!(r.is_err());
+    // Four elements, four destructors: element 3 is dropped by the unwind
+    // path, and nothing is dropped twice.
+    assert_eq!(drops.load(Ordering::SeqCst), 4);
+    // Safety: the block was allocated by `v` with
+    // `Layout::array::<DropBomb>(cap)` and the container's `dealloc` was
+    // skipped by the unwind. Every element has been dropped, so reclaiming
+    // the raw block is sound and leaves no leak.
+    unsafe {
+        std::alloc::dealloc(
+            ptr as *mut u8,
+            std::alloc::Layout::array::<DropBomb>(cap).unwrap(),
+        );
+    }
 }
 
 // --------------------------------------------------------------------------

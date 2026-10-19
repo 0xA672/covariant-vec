@@ -148,7 +148,7 @@ fn n_zero_first_spill_is_floored() {
 // -------------------------------------------------------------------------- //
 
 #[test]
-#[should_panic]
+#[should_panic(expected = "out of range for slice of length 3")]
 fn drain_inclusive_usize_max_panics() {
     let mut v = CovariantVec::<i32, 4>::new();
     v.extend([1, 2, 3]);
@@ -403,9 +403,10 @@ impl Drop for ZSide {
 
 #[test]
 fn from_elem_zst_side_effects() {
-    // `from_elem` moves the argument into slot 0 and clones *that* for the
-    // rest, so a side-effectful `Clone` runs exactly `n - 1` times and there are
-    // exactly `n` destructors (`vec![elem; n]` semantics).
+    // `from_elem` clones into the first `n - 1` slots and moves the
+    // argument into the last, so a side-effectful `Clone` runs exactly
+    // `n - 1` times and there are exactly `n` destructors (`vec![elem; n]`
+    // semantics, including the clone order).
     ZCLONE_CTR.store(0, Ordering::SeqCst);
     ZDROP_FE.store(0, Ordering::SeqCst);
     let v = CovariantVec::<ZSide, 4>::from_elem(ZSide, 5);
@@ -414,6 +415,61 @@ fn from_elem_zst_side_effects() {
     assert_eq!(ZDROP_FE.load(Ordering::SeqCst), 0);
     drop(v);
     assert_eq!(ZDROP_FE.load(Ordering::SeqCst), 5);
+}
+
+/// `Clone` that hands out a fresh id, so the test can see *which* slot
+/// received the moved original. `from_elem` must match `vec![elem; n]`:
+/// clones in `[0, n - 1)` and the original in slot `n - 1`.
+#[test]
+fn from_elem_matches_std_clone_order() {
+    static NEXT: AtomicUsize = AtomicUsize::new(1000);
+    #[derive(Debug)]
+    struct Ident(usize);
+    impl Clone for Ident {
+        fn clone(&self) -> Self {
+            Ident(NEXT.fetch_add(1, Ordering::SeqCst))
+        }
+    }
+
+    NEXT.store(1000, Ordering::SeqCst);
+    let v = CovariantVec::<Ident, 4>::from_elem(Ident(7), 4);
+    assert_eq!(
+        v.iter().map(|x| x.0).collect::<Vec<_>>(),
+        vec![1000, 1001, 1002, 7]
+    );
+
+    NEXT.store(1000, Ordering::SeqCst);
+    let std_v = vec![Ident(7); 4];
+    assert_eq!(
+        std_v.iter().map(|x| x.0).collect::<Vec<_>>(),
+        vec![1000, 1001, 1002, 7]
+    );
+}
+
+#[test]
+fn extend_from_slice_inline_heap_zst_and_empty() {
+    let mut v = CovariantVec::<u32, 4>::new();
+    v.extend_from_slice(&[1, 2]);
+    assert!(!v.is_heap());
+    v.extend_from_slice(&[3, 4]);
+    assert!(!v.is_heap());
+    assert_eq!(&*v, &[1, 2, 3, 4]);
+
+    // Spill.
+    v.extend_from_slice(&[5, 6]);
+    assert!(v.is_heap());
+    assert_eq!(&*v, &[1, 2, 3, 4, 5, 6]);
+
+    // Empty is a no-op.
+    let cap = v.capacity();
+    v.extend_from_slice(&[]);
+    assert_eq!((v.len(), v.capacity()), (6, cap));
+
+    // ZST: the count is the ownership.
+    let mut z = CovariantVec::<(), 4>::new();
+    z.extend_from_slice(&[(), (), ()]);
+    assert_eq!(z.len(), 3);
+    assert!(!z.is_heap());
 }
 
 // -------------------------------------------------------------------------- //
@@ -469,13 +525,12 @@ fn resize_grow_inline_moves_original_into_last_slot() {
     assert_eq!(v.len(), 6);
     assert_eq!(clones.load(Ordering::SeqCst), 2 + 2); // 2 from `from_elem`
     assert_eq!(drops.load(Ordering::SeqCst), 0); // the moved original is not dropped
-                                                 // Slots 0..=2 are the `from_elem` elements (slot 0 is the original, the rest
-                                                 // are clones, so `val` is shifted); 3..=4 are the resize clones (`val`
-                                                 // shifted); slot 5 is the moved original (unshifted).
-    assert_eq!(v[0].val, 0);
-    for i in 1..3 {
-        assert_eq!(v[i].val, 1000);
-    }
+                                                 // Slots 0..=2 are the `from_elem` elements (the first two are clones, so
+                                                 // `val` is shifted; slot 2 is the original); 3..=4 are the resize clones
+                                                 // (`val` shifted); slot 5 is the moved original (unshifted).
+    assert_eq!(v[0].val, 1000);
+    assert_eq!(v[1].val, 1000);
+    assert_eq!(v[2].val, 0);
     for i in 3..5 {
         assert_eq!(v[i].val, 1007);
     }
@@ -503,20 +558,40 @@ fn resize_grow_heap_moves_original_into_last_slot() {
     assert_eq!(drops.load(Ordering::SeqCst), 9);
 }
 
+// Separate statics from `ZSide`'s: `from_elem_zst_side_effects` resets and
+// measures the same counters, and libtest runs the two tests in parallel, so
+// sharing them would make both measurements racy (a `store(0)` in one test
+// could land inside the other's window).
+static RZCLONE_CTR: AtomicUsize = AtomicUsize::new(0);
+static RZDROP_CTR: AtomicUsize = AtomicUsize::new(0);
+
+struct RZSide;
+impl Clone for RZSide {
+    fn clone(&self) -> Self {
+        RZCLONE_CTR.fetch_add(1, Ordering::SeqCst);
+        RZSide
+    }
+}
+impl Drop for RZSide {
+    fn drop(&mut self) {
+        RZDROP_CTR.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 #[test]
 fn resize_grow_zst_clone_drop_counts() {
     // `vec![elem; n]`-style accounting for a side-effectful ZST: growing 5 -> 9
     // clones 3 more times (4 came from `from_elem`), never drops an extra
     // original, and ends with exactly `new_len` destructors.
-    ZCLONE_CTR.store(0, Ordering::SeqCst);
-    ZDROP_FE.store(0, Ordering::SeqCst);
-    let mut v = CovariantVec::<ZSide, 4>::from_elem(ZSide, 5);
-    v.resize(9, ZSide);
+    RZCLONE_CTR.store(0, Ordering::SeqCst);
+    RZDROP_CTR.store(0, Ordering::SeqCst);
+    let mut v = CovariantVec::<RZSide, 4>::from_elem(RZSide, 5);
+    v.resize(9, RZSide);
     assert_eq!(v.len(), 9);
-    assert_eq!(ZCLONE_CTR.load(Ordering::SeqCst), 4 + 3);
-    assert_eq!(ZDROP_FE.load(Ordering::SeqCst), 0);
+    assert_eq!(RZCLONE_CTR.load(Ordering::SeqCst), 4 + 3);
+    assert_eq!(RZDROP_CTR.load(Ordering::SeqCst), 0);
     drop(v);
-    assert_eq!(ZDROP_FE.load(Ordering::SeqCst), 9);
+    assert_eq!(RZDROP_CTR.load(Ordering::SeqCst), 9);
 }
 
 // -------------------------------------------------------------------------- //
@@ -777,8 +852,9 @@ fn from_elem_panicking_clone_drops_are_balanced() {
         let _v = CovariantVec::<BombClone, 4>::from_elem(elem, 10);
     }));
     assert!(r.is_err());
-    // Slot 0 holds the moved `elem`; two clones were built before the third
-    // panicked, so three values exist and must each drop exactly once.
+    // Two clones were written before the third panicked; the in-flight
+    // `elem` is dropped by the unwind, so three values exist and must each
+    // drop exactly once.
     assert_eq!(drops.load(Ordering::SeqCst), 3);
 }
 
@@ -834,6 +910,29 @@ fn resize_with_panicking_closure_drop_accounting() {
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     drop(v);
     assert_eq!(drops.load(Ordering::SeqCst), 4); // each live element exactly once
+}
+
+/// Heap twin of `resize_with_panicking_closure_leaves_consistent`: the
+/// hoisted heap fast path must still publish the length after every write, so
+/// a panic in the closure leaves exactly the produced prefix counted.
+#[test]
+fn resize_with_panicking_closure_heap_keeps_prefix() {
+    let mut v = CovariantVec::<i32, 4>::new();
+    v.extend(0..8);
+    assert!(v.is_heap());
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        let mut k = 0;
+        v.resize_with(12, || {
+            k += 1;
+            if k == 3 {
+                panic!("intentional resize_with panic");
+            }
+            100 + k
+        });
+    }));
+    assert!(r.is_err());
+    assert_eq!(v.len(), 10);
+    assert_eq!(&*v, &[0, 1, 2, 3, 4, 5, 6, 7, 101, 102]);
 }
 
 #[test]
@@ -967,14 +1066,39 @@ fn clone_from_reuses_destination_capacity() {
     // The destination's block is reused, not reallocated.
     assert_eq!(dest.capacity(), big_cap);
     assert_eq!(dest.len(), src.len());
-    assert_eq!(dest[0].val, 1009); // clone: `val` shifted by 1000
-    assert_eq!(dest[1].val, 2009); // clone of a clone: shifted twice
-    assert_eq!(dest[2].val, 2009);
+    // `from_elem` puts clones in slots 0..2 and the original in slot 2,
+    // so the source is `[1009, 1009, 9]` and its clones are
+    // `[2009, 2009, 1009]`.
+    assert_eq!(dest[0].val, 2009); // clone: `val` shifted by 1000
+    assert_eq!(dest[1].val, 2009);
+    assert_eq!(dest[2].val, 1009);
     // The destination's old 8 elements were dropped; the source's were cloned.
     assert_eq!(drops.load(Ordering::SeqCst), 8);
     assert_eq!(clones.load(Ordering::SeqCst), 3);
     drop(dest);
     drop(src);
+}
+
+/// `clone` normalizes a result that fits inline to the inline state, and
+/// `clone_from` is documented as `*self = source.clone()`. A heap
+/// destination with spare capacity must therefore shrink back inline when the
+/// source fits, rather than reusing the block (which would make `is_heap()`
+/// and `capacity()` observably different from `clone`).
+#[test]
+fn clone_from_small_source_normalizes_heap_destination_to_inline() {
+    let mut dest = CovariantVec::<i32, 4>::with_capacity(16);
+    dest.extend(0..10);
+    assert!(dest.is_heap());
+    let src: CovariantVec<i32, 4> = [1, 2].into_iter().collect();
+    assert!(!src.is_heap());
+
+    dest.clone_from(&src);
+    let normalized = src.clone();
+    assert_eq!(&*dest, &[1, 2]);
+    assert!(!dest.is_heap());
+    assert_eq!(dest.is_heap(), normalized.is_heap());
+    assert_eq!(dest.capacity(), normalized.capacity());
+    assert_eq!(dest.capacity(), 4);
 }
 
 #[test]

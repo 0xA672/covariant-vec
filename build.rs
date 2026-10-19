@@ -7,6 +7,12 @@ fn main() {
     // of bumping the MSRV.
     println!("cargo:rustc-check-cfg=cfg(has_error_trait)");
     println!("cargo:rerun-if-changed=build.rs");
+    // The version probe below depends on which compiler `RUSTC` names; without
+    // this, a toolchain switch would reuse the cached `has_error_trait` cfg.
+    println!("cargo:rerun-if-env-changed=RUSTC");
+    // A wrapper (`sccache`, a distro shim, …) sits between cargo and the
+    // compiler, so treat it as an input to the probe as well.
+    println!("cargo:rerun-if-env-changed=RUSTC_WRAPPER");
 
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
     let Ok(out) = Command::new(&rustc).arg("--version").output() else {

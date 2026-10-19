@@ -27,6 +27,37 @@ jobs:
       # job uses is >= 1.81, so the cfg must be present.
       - run: cargo rustc --features cow -- --print cfg | grep -qx 'has_error_trait'
 
+  test-32bit:
+    name: test (stable, 32-bit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-unknown-linux-gnu
+      # `CovariantCow::from(Vec)`'s length/capacity guards against
+      # `MAX_LEN = 2^30 - 1` are only reachable on 32-bit; the 32-bit-only
+      # test in `tests/cow.rs` exercises the capacity guard. `gcc-multilib`
+      # supplies the 32-bit crt/libc objects needed to link and run the tests.
+      - run: sudo apt-get update && sudo apt-get install -y gcc-multilib
+      - run: cargo test --features cow --target i686-unknown-linux-gnu
+
+  no-std:
+    name: build (no_std cross-compile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf
+      # Cross-compile smoke test for a target with no `std` at all. The host
+      # test jobs cannot catch an accidental `std`-only import (or a `std`-only
+      # trait method) because `std` is always available there; this one fails
+      # at link-free `cargo build` time instead. Both feature configurations
+      # are checked because `cow` pulls in code the default build never sees.
+      - run: cargo build --target thumbv7em-none-eabihf --features cow
+      - run: cargo build --target thumbv7em-none-eabihf --no-default-features
+
   test-nightly:
     name: test (nightly, all features incl. dropck_eyepatch)
     runs-on: ubuntu-latest

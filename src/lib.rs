@@ -87,9 +87,8 @@
 //!
 //! ## `T: Copy` fast paths (nightly only)
 //!
-//! Every clone loop in the crate — `Clone` on both containers,
-//! `CovariantCow::to_mut` and `CovariantCow::try_materialize` — runs through
-//! one shared helper. With the `specialization` feature on, a `T: Copy`
+//! Every clone loop in the crate — `Clone` on both containers and
+//! `CovariantCow::to_mut`/`try_to_mut` — runs through one shared helper. With the `specialization` feature on, a `T: Copy`
 //! element is filled with a single `ptr::copy_nonoverlapping` instead of
 //! element by element.
 //!
@@ -108,9 +107,11 @@
 //! ## Fallible allocation
 //!
 //! The `try_reserve` / `try_reserve_exact` family (on [`CovariantVec`] and,
-//! under the `cow` feature, `CovariantCow`) reports failure as a
-//! [`TryReserveError`] instead of panicking on capacity overflow or aborting on
-//! allocation failure. [`TryReserveError::kind`] distinguishes the two cases.
+//! under the `cow` feature, `CovariantCow`), plus
+//! `CovariantCow::try_to_mut` (the fallible twin of `to_mut`), report failure
+//! as a [`TryReserveError`] instead of panicking on capacity overflow or
+//! aborting on allocation failure. [`TryReserveError::kind`] distinguishes the
+//! two cases.
 //!
 //! This needs no unstable API: the global allocator's `alloc`/`realloc`
 //! already report failure by returning a **null pointer** (it is
@@ -119,16 +120,41 @@
 //! pointer. [`alloc::collections::TryReserveError`] has no public constructor,
 //! so this crate defines its own error type with the same two failure modes.
 //!
+//! ## Bulk operations
+//!
+//! `append`, `split_off`, `splice`, `extract_if` and `extend_from_slice` are
+//! provided natively over the two-state encoding — no `Vec` round-trip:
+//!
+//! * [`append`](CovariantVec::append) moves `other`'s elements directly
+//!   into `self`'s storage; an inline-to-inline append that fit allocates
+//!   nothing.
+//! * [`extend_from_slice`](CovariantVec::extend_from_slice) is the stable
+//!   `T: Copy` bulk append: one `memcpy` and one length publication (the
+//!   cow's twin fuses the copy-on-write with the reservation).
+//! * [`split_off`](CovariantVec::split_off) state-normalizes its result
+//!   the way [`Clone`] does (inline tail → inline, longer tail → heap
+//!   with capacity exactly its length).
+//! * [`splice`](CovariantVec::splice) refills the [`Drain`]'s dead slots
+//!   in place before the rollback, so a replacement no longer than the
+//!   range costs no allocation; a longer replacement is written in
+//!   geometrically growing chunks (one tail shift for an exact size hint,
+//!   `O(n · log k)` rather than one shift per element for a
+//!   zero-lower-bound iterator).
+//! * [`extract_if`](CovariantVec::extract_if) shares the backshift scan
+//!   with [`retain_mut`](CovariantVec::retain_mut), publishing an empty
+//!   length for the scan's duration (forget → leak, never double-drop).
+//!
+//! `sort*`/`dedup*` remain reachable through [`DerefMut`].
+//!
 //! ## Deliberately not provided
 //!
-//! * **`append` / `split_off` / `splice` / `extract_if`** — omitted for now to
-//!   keep the unsafe surface small. `sort*`/`dedup*` are already reachable
-//!   through [`DerefMut`], and a `Vec` round-trip covers the rest.
-//! * **A stable `T: Copy` bulk-copy fast path** — specialization is the only
-//!   mechanism that keys on `T: Copy` exactly, and it is nightly-only; on
-//!   stable the generic element-wise path is used for every type (correct,
-//!   just not maximally fast for `Copy` elements). See the `specialization`
-//!   feature for the opt-in.
+//! * **A stable `T: Copy` specialization of the clone loops** — specialization
+//!   is the only mechanism that keys on `T: Copy` exactly, and it is
+//!   nightly-only; on stable the generic element-wise path is used for every
+//!   type (correct, just not maximally fast for `Copy` elements). See the
+//!   `specialization` feature for the opt-in.
+//!   [`extend_from_slice`](CovariantVec::extend_from_slice) is the stable
+//!   bulk-copy entry point; it takes `&[T]`, so it needs no specialization.
 
 #![cfg_attr(feature = "dropck_eyepatch", feature(dropck_eyepatch))]
 // `specialization` is an incomplete feature, so enabling it also silences the
@@ -165,7 +191,7 @@ mod clone_fill;
 #[cfg(feature = "cow")]
 mod cow;
 #[cfg(feature = "cow")]
-pub use cow::{CovariantCow, CowDrain, CowIntoIter};
+pub use cow::{CovariantCow, CowDrain, CowExtractIf, CowIntoIter, CowSplice};
 
 #[cfg(feature = "specialization")]
 use clone_fill::CloneRepeat;
@@ -217,39 +243,68 @@ pub(crate) const fn min_non_zero_cap<T>() -> usize {
 /// container of length `len`. Shared by [`CovariantVec::drain`] and (under the
 /// `cow` feature) `CovariantCow::drain`/`drain_owned`, so the range semantics
 /// and panic messages live in one place.
+///
+/// The check order and reported indices mirror `core::slice::index`'s
+/// `try_into_slice_range` + `slice_index_fail` (what `Vec::drain` uses): the
+/// **end** bound is validated first, and an inclusive end at or past `len`
+/// reports the inclusive index itself. This is why `drain(5..6)` reports the
+/// end index, not the start index.
 #[track_caller]
 pub(crate) fn drain_bounds<R: RangeBounds<usize>>(range: &R, len: usize) -> (usize, usize) {
-    let begin = match range.start_bound() {
-        Bound::Included(&i) => i,
-        // `saturating_add` (not `+ 1`): an out-of-range `Excluded(usize::MAX)`
-        // start would otherwise overflow. It saturates to `usize::MAX`, which
-        // then trips the `begin <= len` assert below as a clean panic (std
-        // reports the same `StartPastEnd` case). The mathematically correct
-        // `MAX + 1` is unrepresentable, but no real container is that long.
-        Bound::Excluded(&i) => i.saturating_add(1),
-        Bound::Unbounded => 0,
-    };
     let end = match range.end_bound() {
-        Bound::Included(&i) => i.saturating_add(1),
-        Bound::Excluded(&i) => i,
+        // std's `EndPastLen` carries the *inclusive* index, so report `i`
+        // rather than `i + 1` (and avoid the overflow entirely).
+        Bound::Included(&i) => {
+            if i >= len {
+                panic!("range end index {i} out of range for slice of length {len}");
+            }
+            i + 1
+        }
+        Bound::Excluded(&i) => {
+            if i > len {
+                panic!("range end index {i} out of range for slice of length {len}");
+            }
+            i
+        }
         Bound::Unbounded => len,
     };
-    // Check order and messages mirror `core::slice::index::slice_index_fail`
-    // (what `Vec::drain` reports): start past `len`, then end past `len`, then
-    // the start-vs-end order.
-    assert!(
-        begin <= len,
-        "range start index {begin} out of range for slice of length {len}"
-    );
-    assert!(
-        end <= len,
-        "range end index {end} out of range for slice of length {len}"
-    );
-    assert!(
-        begin <= end,
-        "slice index starts at {begin} but ends at {end}"
-    );
+    let begin = match range.start_bound() {
+        Bound::Included(&i) => {
+            if i > end {
+                slice_index_fail(i, end, len);
+            }
+            i
+        }
+        // `i >= end` (not `i > end`): `i` is exclusive, and std reports
+        // `StartPastEnd` for `Excluded(i)` when `i == end` too, which then
+        // falls through to `slice_index_fail`'s inclusive-end message.
+        Bound::Excluded(&i) => {
+            if i >= end {
+                slice_index_fail(i, end, len);
+            }
+            i + 1
+        }
+        Bound::Unbounded => 0,
+    };
     (begin, end)
+}
+
+/// Mirrors `core::slice::index::slice_index_fail`: the start-vs-`len` check,
+/// then the end-vs-`len` check, then the start-vs-end order, then the
+/// inclusive-end fallback (reachable when an `Excluded` start equals the end).
+#[cold]
+#[track_caller]
+fn slice_index_fail(start: usize, end: usize, len: usize) -> ! {
+    if start > len {
+        panic!("range start index {start} out of range for slice of length {len}");
+    }
+    if end > len {
+        panic!("range end index {end} out of range for slice of length {len}");
+    }
+    if start > end {
+        panic!("slice index starts at {start} but ends at {end}");
+    }
+    panic!("range end index {end} out of range for slice of length {len}");
 }
 
 /// The error type returned by the `try_reserve*` family.
@@ -863,6 +918,53 @@ impl<'a, T, const N: usize> CovariantVec<'a, T, N> {
         }
     }
 
+    /// Appends a copy of every element of `other`, like
+    /// [`Vec::extend_from_slice`](alloc::vec::Vec::extend_from_slice), but
+    /// bounded on `T: Copy` so the copy is a single bulk `memcpy` **on
+    /// stable** (no `specialization` feature required).
+    ///
+    /// This is the stable-build complement of the `T: Copy` fast paths: one
+    /// reservation, one `copy_nonoverlapping`, one length publication.
+    /// Nothing user-visible can run between the copy and the publication, so
+    /// there is no partially-filled window; in the inline state the
+    /// publication is a write to `self.len` (a different location), so the
+    /// destination pointer derived before it stays valid under Stacked
+    /// Borrows.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `"capacity overflow"` if the combined length is not
+    /// representable, and aborts through the allocation-error hook if the
+    /// reservation fails. Both happen before any element is copied.
+    #[track_caller]
+    pub fn extend_from_slice(&mut self, other: &[T])
+    where
+        T: Copy,
+    {
+        let other_len = other.len();
+        if other_len == 0 {
+            return;
+        }
+        self.reserve(other_len);
+        let self_len = self.raw_len();
+        if size_of::<T>() == 0 {
+            // No bytes exist; the count is the ownership (ZST protocol site
+            // 1). `reserve` enforced the representable-length bound, and a
+            // `Copy` ZST has no destructor to balance.
+            self.len = (self.len & HEAP_TAG) | (self_len + other_len);
+            return;
+        }
+        // Safety: `reserve` guaranteed capacity for `self_len + other_len`
+        // slots, so `[self_len, self_len + other_len)` is in bounds and
+        // uninitialized. `other` cannot overlap this vector's storage: a
+        // `&mut self` and a safe `&[T]` pointing into it cannot coexist.
+        unsafe {
+            let dst = self.base_ptr().add(self_len);
+            ptr::copy_nonoverlapping(other.as_ptr(), dst, other_len);
+            self.set_len(self_len + other_len);
+        }
+    }
+
     /// Appends exactly `additional` elements produced by `f(k)` for `k` in
     /// `0..additional`, assuming capacity for them has already been reserved by
     /// the caller.
@@ -875,6 +977,33 @@ impl<'a, T, const N: usize> CovariantVec<'a, T, N> {
     where
         F: FnMut(usize) -> T,
     {
+        if self.is_heap() {
+            // Hoisted heap fast loop, the stable-build complement of
+            // `spec::bulk`: the caller reserved capacity for all `additional`
+            // slots and this loop never allocates, so the state and base are
+            // fixed. The elements live in the independent block, so the
+            // `self.len` publications below do not invalidate `base` (Stacked
+            // Borrows is per location) — the same argument as
+            // `extend_from_iter`'s single-entry loop.
+            let base = self.base_ptr();
+            let mut len = self.raw_len();
+            debug_assert!(additional <= self.capacity() - len);
+            for k in 0..additional {
+                let value = f(k);
+                // Safety: `len < capacity` (reserved by the caller), so slot
+                // `len` is in bounds and uninitialized; `base` stays valid
+                // across the publication below.
+                unsafe { base.add(len).write(value) };
+                len += 1;
+                // Published before the next `f(k)` (user code, may panic), so
+                // a panic leaves exactly the produced prefix counted.
+                self.len = HEAP_TAG | len;
+            }
+            return;
+        }
+        // Inline (and ZST) state: the elements live inside `self`, so the
+        // length publication invalidates a hoisted pointer; re-derive per
+        // element.
         for k in 0..additional {
             let len = self.raw_len();
             debug_assert!(len < self.capacity());
@@ -885,12 +1014,10 @@ impl<'a, T, const N: usize> CovariantVec<'a, T, N> {
             // write. For a ZST this write is a no-op that still *consumes* the
             // value (ZST protocol site 1: the count owns its destructor).
             unsafe {
-                let p = if self.is_heap() {
-                    self.data.heap.0.cast::<T>().as_ptr().add(len)
-                } else {
-                    addr_of_mut!(self.data.inline).cast::<T>().add(len)
-                };
-                p.write(value);
+                addr_of_mut!(self.data.inline)
+                    .cast::<T>()
+                    .add(len)
+                    .write(value);
             }
             self.len = (self.len & HEAP_TAG) | (len + 1);
         }
@@ -1003,10 +1130,9 @@ impl<'a, T, const N: usize> CovariantVec<'a, T, N> {
     /// Clone/drop accounting matches `Vec`'s (`extend_with`): for `n >= 1`,
     /// `elem` is cloned into the first `n - 1` slots and the **original** is
     /// moved into the last one, so `T::clone` runs `n - 1` times and the
-    /// original is not dropped during the call. This implementation seeds slot
-    /// 0 with the original and clones *that* slot instead — same counts, with
-    /// the original in a different position (unobservable for a
-    /// value-preserving `Clone`).
+    /// original is not dropped during the call. This is also the clone order:
+    /// a side-effectful or identity-carrying `Clone` sees the same sequence
+    /// and leaves the original in the same slot as `vec![elem; n]`.
     #[must_use]
     #[track_caller]
     pub fn from_elem(elem: T, n: usize) -> Self
@@ -1020,10 +1146,9 @@ impl<'a, T, const N: usize> CovariantVec<'a, T, N> {
         out.reserve(n);
         #[cfg(feature = "specialization")]
         {
-            // Move the owned `elem` into slot 0, then clone *that* slot for
-            // the rest (exactly `n` values, hence `n` destructors —
-            // `vec![elem; n]` semantics; cloning `elem` into every slot
-            // would create `n + 1` destructors). Under `T: Copy` this is one
+            // Clone into slots `[0, n - 1)` and move the original into the
+            // last one — exactly `Vec`'s `extend_with` order (exactly `n`
+            // values, hence `n` destructors). Under `T: Copy` this is one
             // length publication plus the O(log n) doubling copies of
             // `spec::bulk` (nothing user-visible can run in between); the
             // stable path below is the same accounting, element-wise.
@@ -1031,37 +1156,24 @@ impl<'a, T, const N: usize> CovariantVec<'a, T, N> {
             // slots `[0, n)` are uninitialized. For a ZST the write consumes
             // `elem` and transfers its conceptual destructor to the count
             // (ZST protocol site 1).
-            unsafe { T::seed_fill(elem, &mut out, n) };
+            unsafe { T::tail_fill(elem, &mut out, 0, n) };
         }
         #[cfg(not(feature = "specialization"))]
         {
-            // Move the owned `elem` into slot 0, then clone *that* slot for
-            // the rest, so exactly `n` values (and hence `n` destructors)
-            // result — `vec![elem; n]` semantics. (Cloning `elem` into every
-            // slot would create `n` clones plus the original, i.e. `n + 1`
-            // destructors.)
-            //
-            // `reserve` may have spilled, so the length writes below preserve
-            // the heap tag via the usual masked form.
-            let dst0 = out.base_ptr();
-            // Safety: capacity `n` was reserved and slot 0 is uninitialized.
-            // For a ZST this consumes `elem` and transfers its conceptual
+            // Clone into slots `[0, n - 1)` and move the original into the
+            // last one — exactly `Vec`'s `extend_with` order, so exactly
+            // `n` values (and hence `n` destructors) result. `fill_with`
+            // carries the hoisted heap fast path and publishes after each
+            // clone, so a panic leaves the produced prefix counted and the
+            // in-flight original is dropped by the unwind.
+            out.fill_with(n - 1, |_| elem.clone());
+            let l = out.raw_len();
+            // Safety: capacity `n` was reserved, slots `[0, n - 1)` are
+            // initialized, and slot `l == n - 1` is uninitialized. For a ZST
+            // the write consumes `elem` and transfers its conceptual
             // destructor to the count (ZST protocol site 1).
-            unsafe { dst0.write(elem) };
-            out.len = (out.len & HEAP_TAG) | 1;
-            for i in 1..n {
-                // Safety: slot 0 is initialized (`base_ptr_const` handles
-                // both states); re-derived each iteration because the
-                // `out.len` write below would invalidate a hoisted pointer in
-                // the inline state. (ZST protocol: for a ZST slot 0 was never
-                // *written*, but reading it through a `&T` touches no bytes,
-                // and the resulting clone is counted — one conceptual
-                // destructor per counted element.)
-                let v = unsafe { (&*out.base_ptr_const()).clone() };
-                // Safety: slot [i] is uninitialized (capacity `n` reserved).
-                unsafe { out.base_ptr().add(i).write(v) };
-                out.len = (out.len & HEAP_TAG) | (i + 1);
-            }
+            unsafe { out.base_ptr().add(l).write(elem) };
+            out.len = (out.len & HEAP_TAG) | (l + 1);
         }
         out
     }
@@ -1455,6 +1567,7 @@ impl<'a, T, const N: usize> CovariantVec<'a, T, N> {
     /// `new_len <= capacity`; if growing, the newly exposed slots must be
     /// initialized; if shrinking, the removed elements must already have been
     /// dropped.
+    #[track_caller]
     pub unsafe fn set_len(&mut self, new_len: usize) {
         debug_assert!(new_len <= self.capacity());
         self.len = (self.len & HEAP_TAG) | new_len;
@@ -1821,6 +1934,15 @@ impl<'a, T: Clone, const N: usize> Clone for CovariantVec<'a, T, N> {
         // leaked-mismatch. The published length stays `0` until then, so the
         // partially-filled prefix is invisible to destructors mid-panic.
         self.clear();
+        // `clone` normalizes a result that fits inline to the inline state
+        // (`clone_normalizes_small_heap_to_inline` pins this), and this method
+        // is documented as `*self = source.clone()`. `clear` left the length
+        // at 0, so `shrink_to_inline` moves no elements and only frees the
+        // block; a source longer than `N` keeps the reused heap block (std's
+        // own `Vec::clone_from` capacity-slack precedent).
+        if len <= N {
+            self.shrink_to_inline();
+        }
         // Safety: `src` is valid for `len` reads (`self` may be inline or
         // heap; `base_ptr_const` handles both; ZST offsets are no-ops), and
         // `self` is owned, empty after `clear`, with capacity >= `len` (either
@@ -1853,7 +1975,9 @@ impl<'a, T, const N: usize> From<Vec<T>> for CovariantVec<'a, T, N> {
             // ZSTs: storage is irrelevant; take the count only. A `Vec` of ZSTs
             // can have an arbitrarily large length (it consumes no memory), so
             // enforce the same bound as `push` — otherwise a length ≥ 2^63
-            // would pollute `HEAP_TAG` and break the state encoding.
+            // would pollute `HEAP_TAG` and break the state encoding. Keep this
+            // guard in sync with `CovariantCow::from(Vec)`, whose bound is
+            // tighter (`MAX_LEN`, since bit 62 is the borrowed tag).
             assert!(len <= isize::MAX as usize, "capacity overflow");
             // Transferring ownership by forgetting `vec` and adopting its
             // length is sound: a ZST has no storage, so neither `vec`'s drop
@@ -2159,10 +2283,13 @@ impl<'a, T, const N: usize> Iterator for IntoIter<'a, T, N> {
         if self.head >= self.tail {
             return None;
         }
-        // Safety: slot [head] is initialized.
-        let p = unsafe { self.vec.base_ptr().add(self.head) };
-        self.head += 1;
-        Some(unsafe { p.read() })
+        let idx = self.head;
+        self.head = idx + 1;
+        // Safety: slot [idx] is initialized. The pointer is derived *after*
+        // the cursor write (the two share this iterator's allocation in the
+        // inline state) so the ordering never relies on Stacked Borrows'
+        // per-location granularity; `next_back` already works this way.
+        Some(unsafe { self.vec.base_ptr().add(idx).read() })
     }
 
     #[inline]
@@ -2336,9 +2463,11 @@ pub struct Drain<'r, 'a, T, const N: usize> {
     end: usize,
     /// Back read cursor into the drained region.
     back: usize,
-    /// Raw length of the container when `drain` was called. Read only on the
-    /// `owns == true` paths (`drop_impl`, `keep_rest`); the empty-range
-    /// placeholder never consults it (its rollback is skipped entirely).
+    /// Raw length of the container when `drain` was called. Read on the
+    /// `owns == true` rollback paths (`drop_impl`, `keep_rest`) and, for an
+    /// empty range, by `Splice`'s fill guard as the length of the container
+    /// still in the caller's slot (the drain's own `Drop` still skips the
+    /// rollback for `owns == false`).
     original_len: usize,
 }
 
@@ -2412,6 +2541,11 @@ impl<'r, 'a, T, const N: usize> Drain<'r, 'a, T, N> {
             back: self.back,
         };
         drop(rb);
+        // The rollback moved the container back into the caller's slot, so
+        // `self.vec` is a taken `ManuallyDrop`. `as_slice`/`as_mut_slice` are
+        // still callable after `keep_rest`; give them a valid empty container
+        // instead of a moved-out value.
+        self.vec = ManuallyDrop::new(CovariantVec::new());
         // The container is back in the caller's slot; `Drop` must do nothing,
         // and the kept elements count as consumed, so the iterator is now
         // exhausted.
@@ -2554,12 +2688,11 @@ impl<'r, 'a, T, const N: usize> Iterator for Drain<'r, 'a, T, N> {
         }
         // Safety: slot `pos` is initialized and not yet yielded. The value is
         // moved out; its slot becomes dead and will be overwritten by the
-        // rollback without ever being dropped again.
-        unsafe {
-            let p = self.vec.base_ptr().add(self.pos);
-            self.pos += 1;
-            Some(p.read())
-        }
+        // rollback without ever being dropped again. The pointer is derived
+        // after the cursor write, matching `IntoIter::next`.
+        let idx = self.pos;
+        self.pos = idx + 1;
+        Some(unsafe { self.vec.base_ptr().add(idx).read() })
     }
 
     #[inline]
@@ -2610,6 +2743,621 @@ unsafe impl<'r, #[may_dangle] 'a, #[may_dangle] T, const N: usize> Drop for Drai
 impl<'r, 'a, T, const N: usize> Drop for Drain<'r, 'a, T, N> {
     fn drop(&mut self) {
         self.drop_impl();
+    }
+}
+
+// --------------------------------------------------------------------------
+// Bulk operations: append / split_off / splice / extract_if.
+//
+// All four run natively over the two-state encoding — none round-trips
+// through a `Vec`. See the crate-level "Bulk operations" section.
+// --------------------------------------------------------------------------
+
+impl<'a, T, const N: usize> CovariantVec<'a, T, N> {
+    /// Moves all the elements of `other` into `self`, leaving `other` empty.
+    ///
+    /// Inline-to-inline appends that fit allocate **nothing**: the elements
+    /// are `ptr::copy_nonoverlapping`-moved straight between the two inline
+    /// buffers. Otherwise `self` spills/resizes once (the same single
+    /// allocation `Vec::append` would make) and the elements are moved
+    /// directly into the fresh block — `other`'s inline contents are never
+    /// copied through an intermediate allocation.
+    ///
+    /// `other` keeps its storage state and capacity (std parity): an empty
+    /// inline `other` stays inline, an emptied heap `other` keeps its block.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `"capacity overflow"` if `self.len() + other.len()` exceeds
+    /// the representable length, and aborts through the allocation-error hook
+    /// if the reservation fails. Both happen before any element moves, so a
+    /// failure leaves both containers untouched.
+    #[track_caller]
+    pub fn append(&mut self, other: &mut Self) {
+        let other_len = other.raw_len();
+        if other_len == 0 {
+            return;
+        }
+        // Reserves (spilling/reallocating `self` if needed) and enforces the
+        // `raw_len + other_len` bound; for a ZST it is the whole job.
+        self.reserve(other_len);
+        if size_of::<T>() == 0 {
+            // ZST: the count *is* the ownership (ZST protocol site 1); no
+            // bytes exist to move. `reserve` above already enforced the
+            // bound, so the sum cannot collide with `HEAP_TAG`.
+            self.len = self.raw_len() + other_len;
+            other.len = 0;
+            return;
+        }
+        let self_len = self.raw_len();
+        // Derived *after* `reserve` (which may have reallocated). No container
+        // access happens between this derivation and the copy.
+        //
+        // Safety: `reserve` guaranteed capacity for `self_len + other_len`
+        // slots; slots `[self_len, self_len + other_len)` are uninitialized.
+        let dst = unsafe { self.base_ptr().add(self_len) };
+        // Safety: `[0, other_len)` are initialized in `other`'s owned storage.
+        let src = other.base_ptr_const();
+        // Safety: the containers are distinct values, so neither storage
+        // aliases the other. This is a bitwise move — the source slots are
+        // retired by the length write below without running destructors.
+        unsafe { ptr::copy_nonoverlapping(src, dst, other_len) };
+        self.len = (self.len & HEAP_TAG) | (self_len + other_len);
+        // `other` keeps its state; only the count moves.
+        other.len &= HEAP_TAG;
+    }
+
+    /// Splits the vector in two at `at`: `self` keeps `[0, at)` and the new
+    /// return value owns `[at, len)`.
+    ///
+    /// The returned vector is state-normalized exactly like [`Clone`]: a tail
+    /// that fits the inline buffer is *inline* (no allocation), a longer tail
+    /// is heap-backed with capacity exactly its length. `self` keeps its
+    /// current storage state and capacity, so nothing is reallocated and no
+    /// element is copied twice.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `at > len`.
+    #[track_caller]
+    #[must_use]
+    pub fn split_off(&mut self, at: usize) -> Self {
+        let len = self.raw_len();
+        assert!(
+            at <= len,
+            "`at` split index (is {at}) should be <= len (is {len})"
+        );
+        let tail = len - at;
+        let mut out = Self::new();
+        if tail == 0 {
+            return out;
+        }
+        if size_of::<T>() == 0 {
+            // ZST: the count *is* the ownership (ZST protocol); no bytes
+            // move, and neither side can be heap-backed.
+            out.len = tail;
+            self.len = at;
+            return out;
+        }
+        if tail > N {
+            // Allocates exactly `tail` and panics/aborts before any element
+            // has moved, so a failure leaves `self` untouched.
+            out.alloc_heap(tail);
+        }
+        // Safety: `[at, len)` are initialized in `self`'s storage.
+        let src = unsafe { self.base_ptr().add(at) };
+        // Safety: `out` owns storage for `tail` slots (inline, or the block
+        // allocated above) and nothing is initialized in it yet.
+        let dst = out.base_ptr();
+        // Safety: distinct containers, hence distinct storage; bitwise move —
+        // the source slots are retired by the length writes below.
+        unsafe { ptr::copy_nonoverlapping(src, dst, tail) };
+        out.len = (out.len & HEAP_TAG) | tail;
+        self.len = (self.len & HEAP_TAG) | at;
+        out
+    }
+
+    /// Replaces the elements of `range` with those produced by
+    /// `replace_with`, returning the removed elements as a [`Splice`].
+    ///
+    /// The removed elements are yielded lazily; the replacement is spliced in
+    /// when the [`Splice`] is dropped (std parity). The drained region's dead
+    /// slots are refilled **in place**, so a replacement no longer than the
+    /// range reallocates only if the container's own growth policy does.
+    ///
+    /// A longer replacement is written in geometrically growing chunks (see
+    /// [`Splice`]); each chunk reserves room, so the container may reallocate
+    /// and an inline vector can spill to the heap — unlike [`Self::drain`],
+    /// whose state never changes. An exact `size_hint` costs one tail shift; a
+    /// zero-lower-bound replacement costs `O(n · log k)` element moves rather
+    /// than one `O(n)` shift per element.
+    ///
+    /// Range validation, panics, and leak semantics mirror [`Self::drain`].
+    #[track_caller]
+    pub fn splice<R, I>(&mut self, range: R, replace_with: I) -> Splice<'_, 'a, T, N, I::IntoIter>
+    where
+        R: RangeBounds<usize>,
+        I: IntoIterator<Item = T>,
+    {
+        Splice {
+            drain: self.drain(range),
+            replace_with: replace_with.into_iter(),
+        }
+    }
+
+    /// Moves out and yields every element `e` for which `f(&mut e)` returns
+    /// `true`, keeping the rest, in order. Never reallocates: the scan is the
+    /// in-place backshift scan of [`Self::retain_mut`], with matched elements
+    /// yielded instead of dropped.
+    ///
+    /// Elements are yielded as they are extracted; the caller owns each one
+    /// the moment it is returned. Dropping the iterator early compacts the
+    /// untouched tail over the moved-out slots and restores the length, so
+    /// the vector is always left consistent — including when `f` panics (the
+    /// element being examined is kept, extracted elements stay with the
+    /// caller, and nothing drops twice). See the [`ExtractIf`] type docs for
+    /// the scan-state and leak semantics.
+    pub fn extract_if<F>(&mut self, pred: F) -> ExtractIf<'_, 'a, T, N, F>
+    where
+        F: FnMut(&mut T) -> bool,
+    {
+        let original_len = self.raw_len();
+        // Publish an empty length for the scan's duration, preserving the
+        // state tag — the same re-entrancy hardening as `retain_mut_impl`,
+        // and what makes `mem::forget(extract_if)` a plain safe leak instead
+        // of a double-drop. Published *before* any pointer is derived
+        // (Stacked Borrows, see `retain_mut_impl`).
+        self.len &= HEAP_TAG;
+        ExtractIf {
+            vec: self,
+            pred,
+            idx: 0,
+            del: 0,
+            original_len,
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
+// Splice
+// --------------------------------------------------------------------------
+
+/// A splicing iterator over a [`CovariantVec`].
+///
+/// Created by [`CovariantVec::splice`]. Yields the removed elements (via the
+/// crate's [`Drain`]) as the iterator is consumed; when the `Splice` is
+/// dropped, the not-yet-yielded removed elements are dropped and the
+/// replacement is spliced in before the [`Drain`] rolls the container back —
+/// std's lazy semantics, with the insertion refilling the drained region's
+/// dead slots in place.
+///
+/// # Panics
+///
+/// If a removed element's destructor panics while the not-yet-yielded
+/// elements are being dropped, the same unwind path as [`Drain`] runs: the
+/// container is rolled back consistent, and the removed elements whose
+/// destructors have not run yet are reclaimed *without* their destructors
+/// running (a deliberate leak-on-panic, as in `Drain`).
+///
+/// A panic from the replacement iterator (or from a capacity-overflow panic
+/// while reserving a chunk) is different: every replacement element already
+/// consumed stays in the container. The drain geometry is advanced after each
+/// write, so the unwind rollback preserves exactly the prefix that was
+/// written and reclaims only the still-dead remainder of the drained region.
+/// (This is std's behavior; the alternative — leaving the geometry stale —
+/// would misplace the tail and could treat a moved-out slot as live.)
+///
+/// A replacement longer than the drained range is inserted in geometrically
+/// growing chunks: each round reserves room, shifts the tail right once, and
+/// fills the opened gap. An exact `size_hint` makes the remainder a single
+/// chunk; a zero-lower-bound iterator (`filter`, `flat_map`,
+/// `take_while`) doubles the chunk per round, so `k` replacement elements
+/// cost `O(k + n · log k)` element moves against an `n`-element tail
+/// instead of the `O(k · n)` of one-slot inserts. A lying hint leaves the
+/// unfilled part of its chunk dead (the rollback compacts it away without
+/// running destructors); elements past the hint are picked up by the next
+/// chunk.
+///
+/// The replacement may therefore reallocate: an inline vector can spill to
+/// the heap, unlike with a [`Drain`], whose inline/heap state never changes.
+/// (std's `Splice` has the same property.)
+///
+/// The replacement is driven from `Drop`, so any of these panics aborts if
+/// the `Splice` is itself being dropped during unwinding (std parity).
+///
+/// # Leaking
+///
+/// Forgetting the `Splice` leaks the whole container — the same semantics as
+/// forgetting a [`Drain`]. An **empty** range never takes the container; its
+/// `Splice` inserts the replacement directly and forgetting it leaks nothing.
+pub struct Splice<'r, 'a, T, const N: usize, I: Iterator<Item = T>> {
+    drain: Drain<'r, 'a, T, N>,
+    replace_with: I,
+}
+
+impl<'r, 'a, T, const N: usize, I: Iterator<Item = T>> Iterator for Splice<'r, 'a, T, N, I> {
+    type Item = T;
+
+    #[inline]
+    fn next(&mut self) -> Option<T> {
+        self.drain.next()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.drain.size_hint()
+    }
+}
+
+impl<'r, 'a, T, const N: usize, I: Iterator<Item = T>> FusedIterator for Splice<'r, 'a, T, N, I> {}
+
+impl<'r, 'a, T: fmt::Debug, const N: usize, I: Iterator<Item = T>> fmt::Debug
+    for Splice<'r, 'a, T, N, I>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Splice")
+            .field(&self.drain.as_slice())
+            .finish()
+    }
+}
+
+/// Initial slot count for [`Splice`]'s geometric chunk schedule. The first
+/// chunk is small so a replacement only slightly longer than the drained hole
+/// does not shift the tail more than necessary; the schedule doubles after
+/// every full chunk, bounding the number of tail shifts to `O(log k)`.
+const SPLICE_CHUNK: usize = 8;
+
+/// Fill guard for [`Splice`]: tracks the dead gap while the replacement is
+/// written and compacts it — publishing the final length — when it drops, on
+/// the normal path *and* during unwinding.
+///
+/// The container lives in `drain.vec` for a non-empty splice and in
+/// `drain.slot` for an empty-range splice (which never takes the container),
+/// so every accessor dispatches on `drain.owns`. During the fill,
+/// `[begin, end)` is dead, `[end, original_len)` is the live tail, and the
+/// container's published length is `original_len` (the dead gap is inside it,
+/// which is what lets the next chunk's `reserve` size from the container's
+/// own length; the guard closes the gap before the container is observable
+/// again).
+struct SpliceFill<'f, 'r, 'a, T, const N: usize> {
+    drain: &'f mut Drain<'r, 'a, T, N>,
+}
+
+impl<'f, 'r, 'a, T, const N: usize> SpliceFill<'f, 'r, 'a, T, N> {
+    /// The container being filled.
+    #[inline]
+    fn vec(&mut self) -> &mut CovariantVec<'a, T, N> {
+        if self.drain.owns {
+            &mut self.drain.vec
+        } else {
+            &mut *self.drain.slot
+        }
+    }
+
+    /// Reserves room for `additional` more slots.
+    #[inline]
+    fn reserve(&mut self, additional: usize) {
+        self.vec().reserve(additional);
+    }
+
+    /// Shifts the live tail right by `slots`, growing the dead gap at
+    /// `begin` by that many slots, and publishes the grown length.
+    ///
+    /// # Safety
+    ///
+    /// Capacity for `original_len + slots` slots; `slots >= 1`.
+    unsafe fn open_gap(&mut self, slots: usize) {
+        let end = self.drain.end;
+        let original_len = self.drain.original_len;
+        // Safety: `[end, original_len)` is the live tail and
+        // `[end + slots, original_len + slots)` is spare capacity. `ptr::copy`
+        // handles the overlap (the destination is to the right).
+        unsafe {
+            let base = self.vec().base_ptr();
+            ptr::copy(base.add(end), base.add(end + slots), original_len - end);
+        }
+        self.drain.end = end + slots;
+        self.drain.original_len = original_len + slots;
+        // Publish the grown length now: the next chunk's `reserve` sizes from
+        // the container's own length, and the shifted tail must lie inside it.
+        // The dead gap is included for the duration of the fill; the guard's
+        // `Drop` compacts it and republishes before the container can be
+        // observed — including on the unwind path.
+        //
+        // Safety: slots `[0, original_len + slots)` are initialized (live
+        // prefix, shifted tail, and the gap, whose slots are dead but closed
+        // before the container is handed back).
+        unsafe { self.vec().set_len(original_len + slots) };
+    }
+
+    /// Writes `x` into the dead gap at `begin` and advances the gap start.
+    ///
+    /// # Safety
+    ///
+    /// `begin < end`; the slot is dead.
+    unsafe fn write(&mut self, x: T) {
+        let at = self.drain.begin;
+        // The base is re-derived for every write rather than hoisted: in the
+        // inline state the elements live inside the container, so a pointer
+        // held across a length publication (or any other reborrow) is
+        // invalidated under Stacked Borrows — the per-location rule described
+        // on `retain_mut_impl`.
+        //
+        // Safety: `at < end <= original_len <= capacity` and the slot is dead.
+        unsafe {
+            let base = self.vec().base_ptr();
+            base.add(at).write(x);
+        }
+        self.drain.begin = at + 1;
+    }
+}
+
+impl<T, const N: usize> Drop for SpliceFill<'_, '_, '_, T, N> {
+    fn drop(&mut self) {
+        if self.drain.begin != self.drain.end {
+            // The replacement ended before the gap closed (an exhausted
+            // zero-hint iterator, a lying lower bound, or a non-fused
+            // iterator). Compact the live tail over the dead remainder.
+            let begin = self.drain.begin;
+            let end = self.drain.end;
+            let tail = self.drain.original_len - end;
+            // Safety: `[end, original_len)` is the live tail and
+            // `[begin, begin + tail)` lies at or before it (`begin < end`), so
+            // `ptr::copy` handles the overlap.
+            unsafe {
+                let base = self.vec().base_ptr();
+                ptr::copy(base.add(end), base.add(begin), tail);
+            }
+            self.drain.end = begin;
+            self.drain.original_len = begin + tail;
+        }
+        let len = self.drain.original_len;
+        // Safety: `[0, len)` is initialized (written prefix + compacted tail)
+        // and `len <= capacity` (every gap was reserved before it was opened).
+        // `set_len` preserves the inline/heap tag.
+        unsafe { self.vec().set_len(len) };
+    }
+}
+
+impl<'r, 'a, T, const N: usize, I: Iterator<Item = T>> Splice<'r, 'a, T, N, I> {
+    /// Shared `Drop` body.
+    fn drop_impl(&mut self) {
+        // Drop the not-yet-yielded removed elements first: the drained region
+        // must be fully dead before the replacement is written into it. (The
+        // drain's own `Drop` would do the same, but only after the splice.)
+        while self.drain.next().is_some() {}
+
+        {
+            let mut fill = SpliceFill {
+                drain: &mut self.drain,
+            };
+            // Phase 1 — refill the dead hole in place: the replacement is
+            // written straight over the moved-out slots, with no shifting.
+            // `begin` is advanced after *every* successful write, not only at
+            // the end: the container's length already counts these slots (they
+            // were live drained elements), so no length update is needed, but
+            // the drain geometry must reflect that they are now live
+            // replacement elements. If `next()` panics, the guard's `Drop`
+            // then shifts the tail over only the still-dead remainder and
+            // keeps the written prefix.
+            while fill.drain.begin < fill.drain.end {
+                match self.replace_with.next() {
+                    Some(x) => {
+                        // Safety: `begin < end`, so the slot is in the dead
+                        // gap. Consumes `x` (ZST protocol site 1 for a ZST:
+                        // the count owns the destructor).
+                        unsafe { fill.write(x) };
+                    }
+                    None => break,
+                }
+            }
+
+            // Phase 2 — a replacement longer than the hole. Grow the container
+            // in geometrically sized chunks: each round reserves a chunk,
+            // shifts the tail right by it in one `ptr::copy`, and fills the
+            // opened gap. An exact `size_hint` (ranges, arrays,
+            // `Vec::IntoIter`) makes the first chunk the whole remainder, so
+            // the common case is still one shift; a zero-lower-bound iterator
+            // (`filter`, `flat_map`, `take_while`) doubles the chunk each
+            // round, so the number of shifts is O(log k) rather than one per
+            // element. Appending the replacement at the end and rotating would
+            // be O(n + k), but it would move the mid-iterator-panic prefix to
+            // the end of the vector instead of keeping it in place at `begin`.
+            //
+            // After a shift, `[begin, end)` is the still-dead gap: the slots
+            // the tail was moved out of (now stale duplicates) plus whatever
+            // part of the chunk the iterator does not fill. The guard shifts
+            // the live tail `[end, original_len)` down over all of it on drop,
+            // so the unfilled part is reclaimed without ever being dropped.
+            // `begin` advances after each write; `end` and `original_len`
+            // advance only with the shift, so `end - begin` is exactly the
+            // remaining dead gap.
+            let mut chunk = SPLICE_CHUNK;
+            'grow: loop {
+                // Pull the first element *before* opening a gap: an exhausted
+                // iterator then costs no shift at all (and a lying huge hint
+                // is never consulted).
+                let Some(x) = self.replace_with.next() else {
+                    break;
+                };
+                // The hint only sizes the chunk. It is clamped to at least the
+                // one element already in hand and, when the upper bound is
+                // honest, to the remainder — so an exact iterator opens
+                // exactly the slots it will fill. A lying hint changes the
+                // chunk size only: an over-large upper bound can still make
+                // `reserve` panic with "capacity overflow", exactly as the
+                // single-batch version did.
+                let (lower, upper) = self.replace_with.size_hint();
+                let mut slots = chunk.max(lower.saturating_add(1));
+                if let Some(upper) = upper {
+                    slots = slots.min(upper.saturating_add(1));
+                }
+                // A capacity-overflow or allocation panic happens here, before
+                // any geometry change: `x` is dropped by the unwind and the
+                // guard sees the phase-1 state.
+                fill.reserve(slots);
+                // Safety: capacity for `original_len + slots`; `slots >= 1`.
+                unsafe { fill.open_gap(slots) };
+                // Safety: the gap is open and `slots >= 1`.
+                unsafe { fill.write(x) };
+                while fill.drain.begin < fill.drain.end {
+                    match self.replace_with.next() {
+                        Some(x) => {
+                            // Safety: `begin < end`.
+                            unsafe { fill.write(x) };
+                        }
+                        None => break 'grow,
+                    }
+                }
+                chunk = chunk.saturating_mul(2);
+            }
+        }
+        // The guard has compacted the gap and published the length. The drain
+        // is exhausted and its geometry now describes exactly the splice: the
+        // tail starts at `end == begin`, so `Drain::drop`'s rollback takes its
+        // empty-range skip and simply hands the container back.
+        self.drain.pos = self.drain.begin;
+        self.drain.back = self.drain.begin;
+    }
+}
+
+// The drop body moves raw bytes and drops *owned* removed elements; it never
+// reads any `T` contents nor anything reachable through `'a`, so it carries
+// the same `#[may_dangle]` annotations as `Drain`'s.
+#[cfg(feature = "dropck_eyepatch")]
+unsafe impl<'r, #[may_dangle] 'a, #[may_dangle] T, const N: usize, I: Iterator<Item = T>> Drop
+    for Splice<'r, 'a, T, N, I>
+{
+    fn drop(&mut self) {
+        self.drop_impl();
+    }
+}
+
+#[cfg(not(feature = "dropck_eyepatch"))]
+impl<'r, 'a, T, const N: usize, I: Iterator<Item = T>> Drop for Splice<'r, 'a, T, N, I> {
+    fn drop(&mut self) {
+        self.drop_impl();
+    }
+}
+
+// --------------------------------------------------------------------------
+// ExtractIf
+// --------------------------------------------------------------------------
+
+/// An iterator that moves the matching elements out of a [`CovariantVec`]
+/// according to a predicate, keeping the rest in their original order.
+///
+/// Created by [`CovariantVec::extract_if`]. The scan is the in-place backshift
+/// scan shared with `retain_mut` (see `retain_mut_impl`), except that matched
+/// elements are *moved out and yielded* instead of dropped.
+///
+/// # State during the scan
+///
+/// While the iterator is alive the vector's length is published as `0` (the
+/// same hardening as `retain_mut`), so a re-entrant call through interior
+/// mutability observes an empty container rather than stale geometry, and
+/// `mem::forget`-ing the iterator is a plain safe leak of the un-processed
+/// elements — never a double-drop hazard. Dropping it early (normally or
+/// while unwinding) compacts the untouched tail over the moved-out slots and
+/// restores the length.
+///
+/// The `FnMut` bound lives on the [`Iterator`] impl, not on this struct: that
+/// keeps the `Drop` impl free of bounds mentioning `T`, matching the shape of
+/// the `Drain`/`IntoIter` `#[may_dangle]` impls.
+pub struct ExtractIf<'r, 'a, T, const N: usize, F> {
+    vec: &'r mut CovariantVec<'a, T, N>,
+    pred: F,
+    /// Index of the next slot to examine, in the *original* coordinates.
+    idx: usize,
+    /// Number of elements moved out so far: `[idx - del, idx)` are dead holes.
+    del: usize,
+    /// Length of the container when the scan started.
+    original_len: usize,
+}
+
+impl<'r, 'a, T, const N: usize, F> Iterator for ExtractIf<'r, 'a, T, N, F>
+where
+    F: FnMut(&mut T) -> bool,
+{
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        // One derivation per call: the predicate reborrows the storage through
+        // `&mut T`, and this loop performs no other container access, so a
+        // single `base_ptr()` per `next` is the crate's usual shape (see
+        // `retain_mut_impl` for the per-location rule).
+        let base = self.vec.base_ptr();
+        while self.idx < self.original_len {
+            // Safety: `idx < original_len <= capacity`; slot `idx` belongs to
+            // the untouched, initialized tail.
+            let cur = unsafe { base.add(self.idx) };
+            if (self.pred)(unsafe { &mut *cur }) {
+                // Safety: initialized and not yet processed; the value is
+                // moved out and its slot becomes a dead hole counted by
+                // `del`. (ZST protocol site 3: for a ZST the read touches no
+                // bytes and the length accounting in `Drop` transfers the
+                // element's one conceptual destructor to the yielded value.)
+                let out = unsafe { ptr::read(cur) };
+                self.idx += 1;
+                self.del += 1;
+                return Some(out);
+            }
+            if self.del > 0 {
+                // Retained with a hole behind it: shift it down one slot.
+                // Safety: distinct slots in the same buffer (`hole < cur`).
+                unsafe { ptr::copy_nonoverlapping(cur, base.add(self.idx - self.del), 1) };
+            }
+            self.idx += 1;
+        }
+        None
+    }
+}
+
+impl<'r, 'a, T, const N: usize, F> ExtractIf<'r, 'a, T, N, F> {
+    /// Shared `Drop` body: compacts the untouched tail over the dead holes
+    /// and restores the length — the same rollback [`BackshiftGuard`]
+    /// performs, inlined here so this `Drop` is self-contained under
+    /// `#[may_dangle]`. It runs no destructor (every hole held a moved-out
+    /// element), so it cannot panic, and it runs on the normal *and* the
+    /// unwinding path.
+    fn rollback(&mut self) {
+        if self.idx < self.original_len && self.del > 0 {
+            // Safety: `[idx, original_len)` is the untouched, initialized
+            // tail; `[idx - del, idx)` is dead. `ptr::copy` handles overlap.
+            unsafe {
+                let base = self.vec.base_ptr();
+                ptr::copy(
+                    base.add(self.idx),
+                    base.add(self.idx - self.del),
+                    self.original_len - self.idx,
+                );
+            }
+        }
+        // Safety: exactly `original_len - del` leading slots are initialized
+        // (retained prefix + compacted tail); this only shrinks, and
+        // `set_len` preserves the state tag published at scan start.
+        unsafe { self.vec.set_len(self.original_len - self.del) };
+    }
+}
+
+// The drop body shifts raw bytes and fixes the length; it never reads any `T`
+// nor anything reachable through `'a` (the predicate is not called on this
+// path), so it carries the same `#[may_dangle]` annotations as the
+// container's/`Drain`'s — otherwise dropping a partially consumed `ExtractIf`
+// after `'a` expires would be rejected, asymmetrically with `Drain`.
+#[cfg(feature = "dropck_eyepatch")]
+unsafe impl<'r, #[may_dangle] 'a, #[may_dangle] T, const N: usize, F> Drop
+    for ExtractIf<'r, 'a, T, N, F>
+{
+    fn drop(&mut self) {
+        self.rollback();
+    }
+}
+
+#[cfg(not(feature = "dropck_eyepatch"))]
+impl<'r, 'a, T, const N: usize, F> Drop for ExtractIf<'r, 'a, T, N, F> {
+    fn drop(&mut self) {
+        self.rollback();
     }
 }
 

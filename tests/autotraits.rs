@@ -8,9 +8,21 @@
 use std::cell::Cell;
 
 use covariant_vec::CovariantVec;
+use static_assertions::assert_not_impl_all;
 
 fn assert_send<T: Send>() {}
 fn assert_sync<T: Sync>() {}
+
+// Negative auto-trait properties, pinned at compile time (a negative bound
+// cannot be written in stable Rust). `Cell<i32>` is `Send + !Sync`, so the
+// container must stay `Send` (asserted in the test below) and must **not**
+// be `Sync`. This also guards the variance marker: if it were ever changed
+// to `PhantomData<&'a T>`, the `Send` assertion would start requiring
+// `T: Sync` and fail to compile.
+assert_not_impl_all!(CovariantVec<'static, Cell<i32>, 4>: Sync);
+
+#[cfg(feature = "cow")]
+assert_not_impl_all!(covariant_vec::CovariantCow<'static, Cell<i32>, 4>: Sync);
 
 #[test]
 fn send_sync_match_vec_semantics() {
@@ -19,7 +31,7 @@ fn send_sync_match_vec_semantics() {
     assert_sync::<CovariantVec<'static, i32, 4>>();
 
     // `Cell<i32>: Send + !Sync`, so the container stays `Send`. The `!Sync`
-    // half is a *negative* property and cannot be asserted positively here.
+    // half is pinned by the module-level `assert_not_impl_all!` above.
     assert_send::<CovariantVec<'static, Cell<i32>, 4>>();
 }
 

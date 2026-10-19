@@ -49,3 +49,10 @@ specialization = []
 cow = []
 
 [dependencies]
+
+[dev-dependencies]
+# Compile-time negative auto-trait assertions (`assert_not_impl_all!`) in
+# `tests/autotraits.rs`. A negative bound cannot be written in stable Rust, so
+# this macro is the standard way to pin "`Cell<i32>` keeps the container
+# `!Sync`" as a build failure rather than a comment.
+static_assertions = "1.1"
