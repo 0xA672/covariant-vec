@@ -90,11 +90,12 @@ impl<T: Copy, C: CloneSink<Elem = T>> CloneFill<C> for T {
 /// non-value-preserving `Clone`).
 ///
 /// Under `T: Copy` it collapses to one length publication plus `bulk`'s
-/// O(log len) doubling `copy_nonoverlapping` calls (≈2× write amplification —
-/// the only true single-memcpy path is `CloneFill`'s `memcpy_fill`) — sound
-/// because no user code runs between the copies and the publication (nothing
-/// can observe a partially-filled buffer or panic), and for a type with no
-/// destructor "moved original" vs "last copy" is unobservable.
+/// O(log len) disjoint doubling `copy_nonoverlapping` calls (each destination
+/// slot written exactly once; the true single-memcpy path is `CloneFill`'s
+/// `memcpy_fill`) — sound because no user code runs between the copies and the
+/// publication (nothing can observe a partially-filled buffer or panic), and
+/// for a type with no destructor "moved original" vs "last copy" is
+/// unobservable.
 pub(crate) trait CloneRepeat<C: CloneSink> {
     /// Fills `dest[start, start + len)` with `len` copies of `elem`, moving
     /// `elem` into slot `start + len - 1` (`Vec::resize`/`vec![elem; n]`
@@ -110,13 +111,23 @@ pub(crate) trait CloneRepeat<C: CloneSink> {
 /// The bulk path for `T: Copy`: seed the first slot of the run with the single
 /// owned value, then double the initialized run (`[0, 1)` → `[1, 2)`,
 /// `[0, 2)` → `[2, 4)`, …) until the whole run is filled, and publish the
-/// length once. That is O(log len) `copy_nonoverlapping` calls with ≈2× write
-/// amplification, but a single publication: nothing between the copies and the
-/// publication can panic or run user code, so there is no partially-filled
-/// window to recover from.
+/// length once. That is O(log len) `copy_nonoverlapping` calls with a single
+/// publication: nothing between the copies and the publication can panic or
+/// run user code, so there is no partially-filled window to recover from.
+/// Each destination slot is written exactly once (the seed plus disjoint
+/// doubling ranges); the cost is the read traffic from the initialized prefix,
+/// not write amplification.
 #[inline]
 unsafe fn bulk<T: Copy, C: CloneSink<Elem = T>>(elem: &T, dest: &mut C, start: usize, len: usize) {
     if len == 0 {
+        return;
+    }
+    if size_of::<T>() == 0 {
+        // No bytes exist for a ZST: the count *is* the value. Publishing the
+        // grown length is the whole operation; skipping the pointer loop also
+        // avoids the pointless same-pointer `copy_nonoverlapping` calls.
+        // Safety: slots `[start, start + len)` are conceptually initialized.
+        unsafe { dest.publish_len(start + len) };
         return;
     }
     // Safety: `dest` is owned with capacity `>= start + len` (caller contract).

@@ -1,12 +1,12 @@
 [package]
 name = "covariant-vec"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
-# MSRV: 1.80. The floor is set by bare `size_of`/`align_of` in the prelude
+# MSRV: 1.92. The floor is set by bare `size_of`/`align_of` in the prelude
 # (1.80) and inline `const {}` blocks (1.79); const generics and `addr_of!`
 # need 1.51+. `dropck_eyepatch` and `specialization` additionally require a
 # nightly compiler.
-rust-version = "1.80"
+rust-version = "1.92"
 description = "A covariant small-vector whose heap/inline discrimination bit is encoded in the length field."
 repository = "https://github.com/0xA672/covariant-vec"
 license = "MIT OR Apache-2.0"

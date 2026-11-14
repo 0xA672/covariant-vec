@@ -46,10 +46,13 @@ fn cow_send_sync() {
 #[cfg(feature = "cow")]
 #[test]
 fn cow_into_iter_is_send_for_non_sync_elem() {
-    // Review #3: `CowIntoIter` always holds an OWNED cow, so the borrowed
-    // state's `T: Sync` requirement does not apply. `Cell<i32>` is
-    // `Send + !Sync`, so this iteration can cross a thread boundary even
-    // though `CovariantCow<'_, Cell<i32>, _>` itself cannot.
+    // Review #3 / lazy IntoIterator: `CowIntoIter` (via `into_iter_owned`)
+    // always holds an OWNED cow, so the borrowed state's `T: Sync` requirement
+    // does not apply. `Cell<i32>` is `Send + !Sync`, so this iteration can
+    // cross a thread boundary even though `CovariantCow<'_, Cell<i32>, _>`
+    // itself cannot. (`IntoIterator` returns the lazy `CowLazyIntoIter`, whose
+    // borrowed variant needs `T: Sync` for `Send`; the owned-only entry point
+    // keeps the lenient bound.)
     use std::thread;
 
     use covariant_vec::CovariantCow;
@@ -60,7 +63,7 @@ fn cow_into_iter_is_send_for_non_sync_elem() {
     let data = vec![Cell::new(1), Cell::new(2), Cell::new(3)].into_boxed_slice();
     let mut c = CovariantCow::<Cell<i32>, 4>::from_borrowed(&data);
     c.to_mut()[0].set(10); // materialize: owned from here on
-    let it = c.into_iter();
+    let it = c.into_iter_owned();
     thread::scope(|s| {
         let handle = s.spawn(move || it.map(|x| x.get()).sum::<i32>());
         assert_eq!(handle.join().unwrap(), 10 + 2 + 3);

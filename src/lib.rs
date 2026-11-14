@@ -448,7 +448,7 @@ impl<'a, T, const N: usize> CovariantVec<'a, T, N> {
 
     /// The heap capacity. Only meaningful in the heap state.
     #[inline]
-    fn heap_cap(&self) -> usize {
+    const fn heap_cap(&self) -> usize {
         debug_assert!(self.is_heap());
         // Safety: the tag says we are in the heap variant.
         unsafe { self.data.heap.1 }
@@ -598,7 +598,7 @@ impl<'a, T, const N: usize> CovariantVec<'a, T, N> {
     /// lower. The two types are otherwise identical here.
     #[inline]
     #[must_use]
-    pub fn capacity(&self) -> usize {
+    pub const fn capacity(&self) -> usize {
         if size_of::<T>() == 0 {
             // ZSTs never spill; capacity is conceptually unbounded up to the
             // representable-length limit.
@@ -863,59 +863,73 @@ impl<'a, T, const N: usize> CovariantVec<'a, T, N> {
             }
             return;
         }
-        if self.is_heap() {
-            // Single-entry fast loop: `base`/`cap`/`len` are hoisted and stay
-            // in registers. No back edge re-enters it (a re-entering loop
-            // would force LLVM to reload the state at the join — verified in
-            // the release asm), so the lying-`size_hint` remainder falls
-            // through to the general loop below instead, which re-derives and
-            // pushes as needed.
-            let base = self.base_ptr();
-            let cap = self.heap_cap();
-            let mut len = self.raw_len();
-            while len < cap {
-                let Some(x) = it.next() else { return };
-                // Safety: heap state with `len < cap`, so slot `len` is in
-                // bounds and uninitialized; `write` moves `x` in without
-                // dropping it. `base` stays valid across the publication
-                // below: it points into the independent block, and writing
-                // `self.len` does not touch that allocation's Stacked-Borrows
-                // stacks.
-                unsafe { base.add(len).write(x) };
-                len += 1;
-                // Published before the next `it.next()` (user code, may
-                // panic), so a panic leaves exactly the elements written so
-                // far counted. `len <= cap <= MAX`, so no tag bit is touched.
-                self.len = HEAP_TAG | len;
+        // Alternate between the register-hoisted heap loop and the general
+        // loop. A spill inside the general loop (`push`) re-enters the fast
+        // path for the remainder; without that, the post-spill elements would
+        // pay the general loop's per-element state reloads/branches exactly
+        // when the destination has just become a heap vector.
+        loop {
+            if self.is_heap() && !self.extend_heap_fast(&mut it) {
+                return;
             }
-            // Reservation exhausted: an iterator that yielded more than its
-            // `size_hint` promised. The general loop handles the remainder.
-        }
-        // General loop (inline state, or the exhausted-heap remainder):
-        // per-element re-derivation — the length publication invalidates a
-        // hoisted pointer when the elements live inside `self` — and `push`
-        // may spill, after which the per-element `is_heap` test picks up the
-        // heap branch.
-        for x in it {
-            let len = self.raw_len();
-            if len < self.capacity() {
-                // Safety: `len < capacity`, so slot `[len]` is in bounds and
-                // uninitialized; `write` moves `x` in without dropping it, and
-                // the tag bits are preserved by the masked length write.
-                unsafe {
-                    let p = if self.is_heap() {
-                        self.data.heap.0.cast::<T>().as_ptr().add(len)
-                    } else {
-                        addr_of_mut!(self.data.inline).cast::<T>().add(len)
-                    };
-                    p.write(x);
+            // General loop (inline state, or the exhausted-heap remainder):
+            // per-element re-derivation — the length publication invalidates a
+            // hoisted pointer when the elements live inside `self`.
+            let mut spilled = false;
+            for x in it.by_ref() {
+                let len = self.raw_len();
+                if len < self.capacity() {
+                    // Safety: `len < capacity`, so slot `[len]` is in bounds and
+                    // uninitialized; `write` moves `x` in without dropping it, and
+                    // the tag bits are preserved by the masked length write.
+                    unsafe {
+                        let p = if self.is_heap() {
+                            self.data.heap.0.cast::<T>().as_ptr().add(len)
+                        } else {
+                            addr_of_mut!(self.data.inline).cast::<T>().add(len)
+                        };
+                        p.write(x);
+                    }
+                    self.len = (self.len & HEAP_TAG) | (len + 1);
+                } else {
+                    // Spare capacity exhausted; `push` spills or reallocates.
+                    self.push(x);
+                    if self.is_heap() {
+                        spilled = true;
+                        break;
+                    }
                 }
-                self.len = (self.len & HEAP_TAG) | (len + 1);
-            } else {
-                // Spare capacity exhausted; `push` spills or reallocates.
-                self.push(x);
+            }
+            if !spilled {
+                return;
             }
         }
+    }
+
+    /// The heap fast loop shared by entry and post-spill re-entry: hoists the
+    /// block pointer, capacity and length so the per-element work is one
+    /// store and one length publication. Returns `true` when capacity was
+    /// exhausted (the caller should continue in the general loop), `false`
+    /// when the iterator finished.
+    #[inline]
+    fn extend_heap_fast<I: Iterator<Item = T>>(&mut self, it: &mut I) -> bool {
+        debug_assert!(self.is_heap());
+        let base = self.base_ptr();
+        let cap = self.heap_cap();
+        let mut len = self.raw_len();
+        while len < cap {
+            let Some(x) = it.next() else { return false };
+            // Safety: heap state with `len < cap`, so slot `len` is in bounds
+            // and uninitialized; `write` moves `x` in without dropping it.
+            // `base` stays valid across the publication: it points into the
+            // independent block and writing `self.len` does not touch that
+            // allocation's Stacked-Borrows stacks.
+            unsafe { base.add(len).write(x) };
+            len += 1;
+            // Published before the next `it.next()` (user code, may panic).
+            self.len = HEAP_TAG | len;
+        }
+        true
     }
 
     /// Appends a copy of every element of `other`, like
@@ -1669,6 +1683,10 @@ struct BackshiftGuard<'r, V: BackshiftTarget> {
     processed_len: usize,
     deleted_cnt: usize,
     original_len: usize,
+    /// Start (original coordinates) of a run of survivors not yet copied down,
+    /// or `None`. A pending run implies `deleted_cnt` is the deletion count at
+    /// the run's start (deletions always flush the run first).
+    run_start: Option<usize>,
 }
 
 impl<V: BackshiftTarget> Drop for BackshiftGuard<'_, V> {
@@ -1680,6 +1698,18 @@ impl<V: BackshiftTarget> Drop for BackshiftGuard<'_, V> {
             // `memmove`.
             unsafe {
                 let base = self.v.backshift_base();
+                // A pending survivor run sits *before* `processed_len` and was
+                // deliberately not moved yet (run-batched compaction). Move it
+                // first; its destination ends exactly where the tail's begins.
+                if let Some(rs) = self.run_start {
+                    if self.processed_len > rs {
+                        ptr::copy(
+                            base.add(rs),
+                            base.add(rs - self.deleted_cnt),
+                            self.processed_len - rs,
+                        );
+                    }
+                }
                 ptr::copy(
                     base.add(self.processed_len),
                     base.add(self.processed_len - self.deleted_cnt),
@@ -1735,6 +1765,7 @@ where
         processed_len: 0,
         deleted_cnt: 0,
         original_len,
+        run_start: None,
     };
     // Hardening, stricter than std: publish an empty length for the scan's
     // duration so a re-entrant call cannot observe the stale geometry (a
@@ -1776,24 +1807,56 @@ where
         }
         g.processed_len += 1;
     }
-    // Stage 2 — at least one hole exists: every element that survives `f` is
-    // shifted down into the hole region as it is examined.
+    // Stage 2 — at least one hole exists: every element that survives `f` will
+    // be shifted down. The copy is *run-batched*: consecutive survivors are
+    // deferred and moved in one `ptr::copy` per run (a scalar store per
+    // element for `i32`, one vectorized `memmove` for wide `T`). A pending run
+    // never crosses a deletion: a deletion flushes it first, so the run's
+    // destination offset is constant.
     while g.processed_len < g.original_len {
         // Safety: as in stage 1.
         let cur = unsafe { base.add(g.processed_len) };
         if !f(unsafe { &mut *cur }) {
+            // Flush the pending survivor run. `cur` is the removed element and
+            // is *not* part of the run. The destination offset uses the
+            // pre-increment deletion count (the run's own offset).
+            if let Some(rs) = g.run_start.take() {
+                if g.processed_len > rs {
+                    // Safety: `[rs, processed_len)` are survivors in the same
+                    // buffer; the destination `[rs - deleted, ..)` abuts the
+                    // compacted prefix. `ptr::copy` handles overlap.
+                    unsafe {
+                        ptr::copy(
+                            base.add(rs),
+                            base.add(rs - g.deleted_cnt),
+                            g.processed_len - rs,
+                        );
+                    }
+                }
+            }
             g.deleted_cnt += 1;
             g.processed_len += 1;
             // Safety: initialized, and removed by the predicate.
             unsafe { ptr::drop_in_place(cur) };
             continue;
         }
-        // Safety: distinct slots in the same buffer (`hole < cur`).
-        unsafe {
-            let hole = base.add(g.processed_len - g.deleted_cnt);
-            ptr::copy_nonoverlapping(cur, hole, 1);
+        if g.run_start.is_none() {
+            g.run_start = Some(g.processed_len);
         }
         g.processed_len += 1;
+    }
+    // Flush the final run before retiring the guard.
+    if let Some(rs) = g.run_start {
+        if g.processed_len > rs {
+            // Safety: as in the mid-scan flush.
+            unsafe {
+                ptr::copy(
+                    base.add(rs),
+                    base.add(rs - g.deleted_cnt),
+                    g.processed_len - rs,
+                );
+            }
+        }
     }
     // Publish the final length (tag-preserving) and retire the guard so its —
     // by now redundant — rollback does not run.
@@ -1929,10 +1992,12 @@ impl<'a, T: Clone, const N: usize> Clone for CovariantVec<'a, T, N> {
             return;
         }
         // Drop the old contents first: a panic inside `T::clone` then leaves
-        // `self` holding exactly the clones made so far (the fill publishes the
-        // length per element), which `Drop` cleans up — no double drops, no
-        // leaked-mismatch. The published length stays `0` until then, so the
-        // partially-filled prefix is invisible to destructors mid-panic.
+        // `self` holding exactly the clones made so far, which `Drop` cleans
+        // up — no double drops, no leaked-mismatch. The element-wise fill
+        // publishes the length per element, so the partially-filled prefix is
+        // visible-but-valid to destructors mid-panic; under `specialization`
+        // the `T: Copy` fill publishes once, which is sound because nothing
+        // user-visible can run between the copy and the publication.
         self.clear();
         // `clone` normalizes a result that fits inline to the inline state
         // (`clone_normalizes_small_heap_to_inline` pins this), and this method
@@ -2579,25 +2644,31 @@ impl<'r, 'a, T, const N: usize> Drain<'r, 'a, T, N> {
             pos: self.pos,
             back: self.back,
         };
-        while rb.pos < rb.back {
-            // Safety: `pos < back <= end <= original_len`; slot `pos` holds an
-            // element that has not been yielded yet. (`pos` is advanced before
-            // the drop purely for this loop's own bookkeeping — the rollback
-            // guard does *not* read `pos`; it shifts using `begin`/`end`/
-            // `original_len` and never runs destructors, so the ordering is not
-            // load-bearing for the unwind path.)
-            //
-            // `rb.vec.base_ptr()` is re-derived every iteration rather than
-            // hoisted across the `rb.pos += 1` bookkeeping. This is required
-            // for the inline state, where the elements share `rb.vec`'s own
-            // allocation (so touching `rb.vec` invalidates a hoisted pointer
-            // under Stacked Borrows); for the heap state a hoisted pointer would
-            // be sound (its provenance is in the independent heap allocation).
-            // Re-deriving is free, so it is done uniformly. See the longer note
-            // on `retain_mut_impl` for the per-location rule.
-            let p = unsafe { rb.vec.base_ptr().add(rb.pos) };
-            rb.pos += 1;
-            unsafe { ptr::drop_in_place(p) };
+        if rb.vec.is_heap() {
+            // Heap state: the block pointer's provenance is in the independent
+            // allocation, and the loop only touches `rb.pos` (a guard field),
+            // so the base can be hoisted once. This removes a per-element
+            // re-derivation from the double-state-agnostic hot loop.
+            // Safety: owned heap state (the drain constructor materializes and
+            // the container was handed over whole).
+            let base = rb.vec.base_ptr();
+            while rb.pos < rb.back {
+                // Safety: `pos < back <= end <= original_len`; slot `pos` holds
+                // an element that has not been yielded yet.
+                let idx = rb.pos;
+                rb.pos += 1;
+                unsafe { ptr::drop_in_place(base.add(idx)) };
+            }
+        } else {
+            while rb.pos < rb.back {
+                // Inline state: the elements live inside `rb.vec`, so a hoisted
+                // pointer would be invalidated by the length/state bookkeeping;
+                // re-derive per element. See the longer note on
+                // `retain_mut_impl` for the per-location rule.
+                let p = unsafe { rb.vec.base_ptr().add(rb.pos) };
+                rb.pos += 1;
+                unsafe { ptr::drop_in_place(p) };
+            }
         }
         // `rb` drops here — or during unwinding — completing the rollback.
     }
@@ -2784,7 +2855,11 @@ impl<'a, T, const N: usize> CovariantVec<'a, T, N> {
         if size_of::<T>() == 0 {
             // ZST: the count *is* the ownership (ZST protocol site 1); no
             // bytes exist to move. `reserve` above already enforced the
-            // bound, so the sum cannot collide with `HEAP_TAG`.
+            // bound, so the sum cannot collide with `HEAP_TAG`. The guards
+            // turn a (buggy) heap-backed ZST invariant violation into a loud
+            // panic instead of silently clearing `HEAP_TAG` and leaking.
+            assert!(!self.is_heap(), "ZST vectors are never heap-backed");
+            assert!(!other.is_heap(), "ZST vectors are never heap-backed");
             self.len = self.raw_len() + other_len;
             other.len = 0;
             return;
@@ -2834,7 +2909,10 @@ impl<'a, T, const N: usize> CovariantVec<'a, T, N> {
         }
         if size_of::<T>() == 0 {
             // ZST: the count *is* the ownership (ZST protocol); no bytes
-            // move, and neither side can be heap-backed.
+            // move, and neither side can be heap-backed. The guard keeps a
+            // (buggy) heap-backed ZST invariant violation from silently
+            // clearing `HEAP_TAG` and leaking.
+            assert!(!self.is_heap(), "ZST vectors are never heap-backed");
             out.len = tail;
             self.len = at;
             return out;
@@ -2987,6 +3065,20 @@ impl<'r, 'a, T, const N: usize, I: Iterator<Item = T>> Iterator for Splice<'r, '
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.drain.size_hint()
     }
+}
+
+impl<'r, 'a, T, const N: usize, I: Iterator<Item = T>> DoubleEndedIterator
+    for Splice<'r, 'a, T, N, I>
+{
+    #[inline]
+    fn next_back(&mut self) -> Option<T> {
+        self.drain.next_back()
+    }
+}
+
+impl<'r, 'a, T, const N: usize, I: Iterator<Item = T>> ExactSizeIterator
+    for Splice<'r, 'a, T, N, I>
+{
 }
 
 impl<'r, 'a, T, const N: usize, I: Iterator<Item = T>> FusedIterator for Splice<'r, 'a, T, N, I> {}
@@ -3311,6 +3403,11 @@ where
         }
         None
     }
+}
+
+impl<'r, 'a, T, const N: usize, F> FusedIterator for ExtractIf<'r, 'a, T, N, F> where
+    F: FnMut(&mut T) -> bool
+{
 }
 
 impl<'r, 'a, T, const N: usize, F> ExtractIf<'r, 'a, T, N, F> {

@@ -1869,11 +1869,11 @@ fn cow_borrowed_retain_closure_panic() {
         })
     }));
     assert!(r.is_err());
-    // The cow materialized before the scan and must remain usable.
-    assert!(!c.is_borrowed());
-    // The guard leaves a consistent (possibly partially-shifted) slice.
-    let len = c.len();
-    assert!(len <= 6);
+    // The borrowed scan is transactional: nothing is committed until every
+    // element has been examined, so a panic leaves the cow borrowed and
+    // untouched (no clone of any removed element ever ran).
+    assert!(c.is_borrowed());
+    assert_eq!(&*c, &[1, 2, 3, 4, 5, 6]);
     // Dropping must not double-free.
     drop(c);
     assert_eq!(data, [1, 2, 3, 4, 5, 6]);
@@ -2528,4 +2528,222 @@ fn cow_extend_with_usize_max_hint_panics_before_allocating() {
     assert!(c.is_borrowed());
     assert_eq!(c.as_borrowed().unwrap().as_ptr(), src);
     assert_eq!(&*c, &data);
+}
+
+// --------------------------------------------------------------------------
+// Lazy borrowed consumption (review: `CowLazyIntoIter` / `CowDrainLazy`)
+// --------------------------------------------------------------------------
+
+/// Clone-counting value type (no `Drop`, so counts isolate `T::clone`).
+fn counts() -> Arc<AtomicUsize> {
+    Arc::new(AtomicUsize::new(0))
+}
+
+#[test]
+fn cow_lazy_into_iter_clones_only_consumed() {
+    let n = counts();
+    let data: Vec<_> = (0..5)
+        .map(|val| CountClone {
+            ctr: Arc::clone(&n),
+            val,
+        })
+        .collect();
+    let c = CovariantCow::<CountClone, 2>::from_borrowed(&data);
+    let mut it = c.into_iter();
+    assert_eq!(n.load(Ordering::SeqCst), 0);
+    assert_eq!(it.next().unwrap().val, 0);
+    assert_eq!(it.next().unwrap().val, 1);
+    // Two `next`s cost exactly two clones; the remaining three are untouched.
+    assert_eq!(n.load(Ordering::SeqCst), 2);
+    assert_eq!(it.as_slice().len(), 3);
+    // `next_back` is lazy too.
+    assert_eq!(it.next_back().unwrap().val, 4);
+    assert_eq!(n.load(Ordering::SeqCst), 3);
+    // Dropping the iterator leaves the borrowed source alone.
+    drop(it);
+    assert_eq!(data.len(), 5);
+}
+
+#[test]
+fn cow_lazy_into_iter_as_mut_slice_materializes_remaining() {
+    let n = counts();
+    let data: Vec<_> = (0..4)
+        .map(|val| CountClone {
+            ctr: Arc::clone(&n),
+            val,
+        })
+        .collect();
+    let mut it = CovariantCow::<CountClone, 2>::from_borrowed(&data).into_iter();
+    assert_eq!(it.next().unwrap().val, 0);
+    let rest = it.as_mut_slice();
+    rest[0].val = 100;
+    // `as_mut_slice` materializes the three remaining elements (the already
+    // consumed one was cloned by `next`).
+    assert_eq!(n.load(Ordering::SeqCst), 4);
+    assert_eq!(it.next().unwrap().val, 100);
+    assert_eq!(it.next().unwrap().val, 2);
+    assert_eq!(it.next().unwrap().val, 3);
+    assert!(it.next().is_none());
+}
+
+#[test]
+fn cow_lazy_drain_clones_only_kept_and_yielded() {
+    let n = counts();
+    let data: Vec<_> = (0..6)
+        .map(|val| CountClone {
+            ctr: Arc::clone(&n),
+            val,
+        })
+        .collect();
+    let mut c = CovariantCow::<CountClone, 4>::from_borrowed(&data);
+    let mut d = c.drain(1..3);
+    // Construction clones only the kept prefix (1) and suffix (3).
+    assert_eq!(n.load(Ordering::SeqCst), 4);
+    assert_eq!(d.next().unwrap().val, 1);
+    assert_eq!(n.load(Ordering::SeqCst), 5);
+    // The second removed element is never cloned: drop the drain with it
+    // unyielded.
+    drop(d);
+    assert_eq!(n.load(Ordering::SeqCst), 5);
+    assert_eq!(
+        c.iter().map(|x| x.val).collect::<Vec<_>>(),
+        vec![0, 3, 4, 5]
+    );
+    assert!(!c.is_borrowed());
+    assert_eq!(data.len(), 6);
+}
+
+#[test]
+fn cow_lazy_drain_keep_rest_rolls_back_removed_run() {
+    let data = [0, 1, 2, 3, 4, 5];
+    let mut c = CovariantCow::<i32, 4>::from_borrowed(&data);
+    {
+        let mut d = c.drain(1..4);
+        assert_eq!(d.next(), Some(1));
+        // Keep 2 and 3.
+        d.keep_rest();
+        assert_eq!(d.next(), None);
+    }
+    // The yielded element 1 is the caller's; 2 and 3 were kept.
+    assert_eq!(&*c, &[0, 2, 3, 4, 5]);
+}
+
+#[test]
+fn cow_lazy_drain_as_mut_slice_materializes_removed_run() {
+    let data = [0, 1, 2, 3, 4, 5];
+    let mut c = CovariantCow::<i32, 4>::from_borrowed(&data);
+    {
+        let mut d = c.drain(1..4);
+        d.as_mut_slice()[0] = 10;
+        assert_eq!(d.next(), Some(10));
+        assert_eq!(d.next(), Some(2));
+        assert_eq!(d.next(), Some(3));
+        assert_eq!(d.next(), None);
+    }
+    assert_eq!(&*c, &[0, 4, 5]);
+    assert_eq!(data, [0, 1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn cow_borrowed_retain_clones_only_kept() {
+    let n = counts();
+    let data: Vec<_> = (0..6)
+        .map(|val| CountClone {
+            ctr: Arc::clone(&n),
+            val,
+        })
+        .collect();
+    let mut c = CovariantCow::<CountClone, 4>::from_borrowed(&data);
+    c.retain(|x| x.val % 2 == 0);
+    // Kept 0, 2, 4 — the three removed elements were never cloned.
+    assert_eq!(n.load(Ordering::SeqCst), 3);
+    assert!(!c.is_borrowed());
+    assert_eq!(c.iter().map(|x| x.val).collect::<Vec<_>>(), vec![0, 2, 4]);
+    assert_eq!(data.len(), 6);
+}
+
+// A ZST with an observable `Clone`: `to_mut` adopts the count without cloning.
+static ZST_CLONES: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug)]
+struct ZstCountClone;
+
+impl Clone for ZstCountClone {
+    fn clone(&self) -> Self {
+        ZST_CLONES.fetch_add(1, Ordering::SeqCst);
+        ZstCountClone
+    }
+}
+
+#[test]
+fn cow_zst_to_mut_adopts_without_cloning() {
+    let data = [ZstCountClone, ZstCountClone, ZstCountClone];
+    let mut c = CovariantCow::<ZstCountClone, 2>::from_borrowed(&data);
+    ZST_CLONES.store(0, Ordering::SeqCst);
+    let s = c.to_mut();
+    assert_eq!(s.len(), 3);
+    assert_eq!(ZST_CLONES.load(Ordering::SeqCst), 0);
+    // `Clone` is the documented exception: it runs `T::clone` per element.
+    let d = c.clone();
+    assert_eq!(ZST_CLONES.load(Ordering::SeqCst), 3);
+    assert_eq!(d.len(), 3);
+}
+
+#[test]
+fn cow_append_borrowed_other_clone_panic_keeps_other_intact() {
+    let ctr = Arc::new(AtomicUsize::new(0));
+    let data = make_data(4, &ctr, 2);
+    let mut other = CovariantCow::<PanicClone, 4>::from_borrowed(&data);
+    let other_ptr = other.as_borrowed().unwrap().as_ptr();
+    let mut c = CovariantCow::<PanicClone, 4>::new();
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        c.append(&mut other);
+    }));
+    assert!(r.is_err());
+    // `other` was not narrowed: still borrowed, same slice, same pointer.
+    assert!(other.is_borrowed());
+    assert_eq!(other.as_borrowed().unwrap().as_ptr(), other_ptr);
+    assert_eq!(other.len(), 4);
+    // `c` holds exactly the cloned prefix.
+    assert_eq!(c.len(), 2);
+    assert_eq!(c.iter().map(|x| x.val).collect::<Vec<_>>(), vec![0, 1]);
+}
+
+/// Reports a small upper bound while yielding many elements: the chunked
+/// splice growth must still produce the full replacement.
+struct LyingUpper(std::vec::IntoIter<i32>);
+
+impl Iterator for LyingUpper {
+    type Item = i32;
+    fn next(&mut self) -> Option<i32> {
+        self.0.next()
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(1))
+    }
+}
+
+#[test]
+fn cow_splice_lying_upper_bound_still_splices_everything() {
+    let data = [1, 2, 3];
+    let mut c = CovariantCow::<i32, 4>::from_borrowed(&data);
+    let out: Vec<i32> = c
+        .splice(1..1, LyingUpper((10..20).collect::<Vec<_>>().into_iter()))
+        .collect();
+    assert!(out.is_empty());
+    let expected: Vec<i32> = [vec![1], (10..20).collect(), vec![2, 3]].concat();
+    assert_eq!(&*c, expected.as_slice());
+}
+
+#[test]
+fn cow_inert_empty_splice_on_full_inline_spills_and_inserts() {
+    let mut c = CovariantCow::<i32, 4>::from_borrowed(&[1, 2, 3, 4]);
+    c.to_mut();
+    assert!(!c.is_heap());
+    assert_eq!(c.len(), 4);
+    let out: Vec<i32> = c.splice(2..2, 0..10).collect();
+    assert!(out.is_empty());
+    assert!(c.is_heap());
+    let expected: Vec<i32> = [vec![1, 2], (0..10).collect(), vec![3, 4]].concat();
+    assert_eq!(&*c, expected.as_slice());
 }

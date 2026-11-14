@@ -319,7 +319,7 @@ impl<'a, T, const N: usize> CovariantCow<'a, T, N> {
     }
 
     #[inline]
-    fn heap_cap(&self) -> usize {
+    const fn heap_cap(&self) -> usize {
         debug_assert!(self.is_heap());
         // Safety: heap state.
         unsafe { self.data.heap.1 }
@@ -403,7 +403,7 @@ impl<'a, T, const N: usize> CovariantCow<'a, T, N> {
     /// length bit (no borrowed tag). Its `From<Vec<ZST>>` overflow threshold is
     /// correspondingly higher.
     #[must_use]
-    pub fn capacity(&self) -> usize {
+    pub const fn capacity(&self) -> usize {
         if self.is_borrowed() {
             self.raw_len()
         } else if size_of::<T>() == 0 {
@@ -519,19 +519,35 @@ impl<'a, T, const N: usize> CovariantCow<'a, T, N> {
                 // an untagged length write on a (buggy) heap-backed ZST cow
                 // would silently clear `HEAP_TAG` and leak the block.
                 assert!(!self.is_heap(), "ZST cows are never heap-backed");
-                for _ in 0..(additional - 1) {
-                    assert!(self.raw_len() < MAX_LEN, "capacity overflow");
-                    // Clone *before* publishing: a panic inside `T::clone`
-                    // must not leave the count claiming a value that was
-                    // never created. The in-flight `value` is dropped by the
-                    // unwind, so the created values stay exactly balanced.
-                    let cloned = value.clone();
-                    self.len = self.raw_len() + 1;
-                    mem::forget(cloned);
+                #[cfg(feature = "specialization")]
+                {
+                    // Feature parity with `CovariantVec::resize`: go through
+                    // `T::tail_fill`, which uses the `T: Copy` bulk path, so a
+                    // `Copy` ZST does not run the element-wise `Clone` loop.
+                    // The default (non-`Copy`) body has the same
+                    // clone-before-publish panic-safety order as the loop below.
+                    let l = self.raw_len();
+                    // Safety: owned ZST state, never heap-backed; `l + additional
+                    // <= MAX_LEN` was enforced by the reserve above, and slots
+                    // `[l, l + additional)` are conceptually uninitialized.
+                    unsafe { T::tail_fill(value, self, l, additional) };
                 }
-                assert!(self.raw_len() < MAX_LEN, "capacity overflow");
-                self.len = self.raw_len() + 1;
-                mem::forget(value);
+                #[cfg(not(feature = "specialization"))]
+                {
+                    for _ in 0..(additional - 1) {
+                        assert!(self.raw_len() < MAX_LEN, "capacity overflow");
+                        // Clone *before* publishing: a panic inside `T::clone`
+                        // must not leave the count claiming a value that was
+                        // never created. The in-flight `value` is dropped by the
+                        // unwind, so the created values stay exactly balanced.
+                        let cloned = value.clone();
+                        self.len = self.raw_len() + 1;
+                        mem::forget(cloned);
+                    }
+                    assert!(self.raw_len() < MAX_LEN, "capacity overflow");
+                    self.len = self.raw_len() + 1;
+                    mem::forget(value);
+                }
             } else {
                 #[cfg(feature = "specialization")]
                 {
@@ -1552,76 +1568,50 @@ impl<'a, T, const N: usize> CovariantCow<'a, T, N> {
         self.len = (self.len & HEAP_TAG) | new_len;
     }
 
+    /// Tag-preserving length publication for the clone loops, which are
+    /// statically known to run on an **owned** cow.
+    ///
+    /// `set_len` carries a real `assert!(!is_borrowed())`, which would re-run
+    /// once per element in `CloneSink::publish_len` (the hot element-wise
+    /// clone loop). The `CloneSink` safety contract already guarantees the
+    /// sink is owned, so only a `debug_assert!` remains here.
+    ///
+    /// # Safety
+    ///
+    /// Slots `[0, new_len)` must be initialized, the cow must be owned, and
+    /// `new_len <= capacity()`.
+    #[inline]
+    unsafe fn publish_len_owned(&mut self, new_len: usize) {
+        debug_assert!(!self.is_borrowed());
+        debug_assert!(new_len <= self.capacity());
+        // Preserve both tag bits (`BORROWED_TAG` is zero for owned cows, but
+        // preserving it matches `backshift_set_len`'s discipline).
+        self.len = (self.len & !LEN_MASK) | new_len;
+    }
+
     /// Builds the [`CowDrain`] for already-validated `(begin, end)` over a
     /// length-`len` container: inert for an empty range, otherwise taking the
     /// whole container out of `self` (the caller must have materialized any
     /// borrowed state first).
     fn make_drain(&mut self, begin: usize, end: usize, len: usize) -> CowDrain<'_, 'a, T, N> {
-        if begin == end {
-            // Empty range: a pure no-op. The container is never taken.
-            return CowDrain {
-                cow: ManuallyDrop::new(CovariantCow::new()),
-                slot: self,
-                owns: false,
-                begin,
-                pos: begin,
-                end,
-                back: end,
-                original_len: len,
-            };
-        }
-        // As in `CovariantVec::drain`: a heap-backed container is handed over as
-        // a state swap (only `(ptr, cap)` + the tagged length) rather than via
-        // `mem::take`, which would memcpy the `N · size_of::<T>()` inline array
-        // — dead padding in the heap state — and copy it back on rollback.
-        let cow = if self.is_heap() {
-            // Safety: owned heap state (`make_drain` is only reached with a
-            // materialized cow when the range is non-empty).
-            let (ptr, cap) = unsafe { self.data.heap };
-            let raw_len = self.len;
-            // Leave the slot an empty inline cow by writing only `len`; see
-            // `CovariantVec::drain` for why the stale union bytes are inert.
-            // (`raw_len` has `BORROWED_TAG` clear — an owned cow is never
-            // borrowed — and `HEAP_TAG` set.)
-            self.len = 0;
-            // Safety: `ptr`/`cap` describe the live block this cow owned and
-            // `raw_len` is its tagged length; ownership moves into the returned
-            // cow, and `self` no longer refers to the block.
-            CovariantCow {
-                data: Data3 { heap: (ptr, cap) },
-                len: raw_len,
-            }
-        } else {
-            mem::take(self)
-        };
-        CowDrain {
-            cow: ManuallyDrop::new(cow),
-            slot: self,
-            owns: true,
-            begin,
-            pos: begin,
-            end,
-            back: end,
-            original_len: len,
-        }
+        make_drain_impl(self, begin, end, len)
     }
 
     /// Removes the specified range and returns an iterator over the removed
     /// elements, in order, from either end.
     ///
-    /// A **borrowed** cow is materialized first (hence the `T: Clone` bound) —
-    /// but only for a **non-empty** range. The range is validated first, so an
-    /// empty range is a pure no-op that leaves a borrowed cow borrowed and
-    /// clones nothing, and a reversed/out-of-bounds range panics without paying
-    /// for a materialization.
+    /// A **borrowed** cow is drained lazily: the kept prefix and suffix are cloned
+    /// into a fresh owned cow at construction and the removed elements are
+    /// cloned only as they are yielded (see [`CowDrainLazy`]), so a partial
+    /// drain never clones the elements it does not yield. An empty range clones
+    /// nothing and leaves a borrowed cow borrowed.
     ///
-    /// The design then mirrors [`CovariantVec::drain`](crate::CovariantVec::drain):
-    /// the whole container is
-    /// moved into the returned [`CowDrain`] and restored on drop, so the tail is
-    /// shifted back and the length restored — even while unwinding. See
-    /// [`CovariantVec::drain`](crate::CovariantVec::drain) for the aliasing
-    /// rationale and the `mem::forget` semantics (forgetting a non-empty
-    /// `CowDrain` leaks the whole cow; an empty range never takes it).
+    /// An **owned** cow behaves exactly like [`CovariantVec::drain`](crate::CovariantVec::drain):
+    /// the whole container is moved into the returned value and restored on
+    /// drop, so the tail is shifted back and the length restored — even while
+    /// unwinding. See that method for the aliasing rationale and the
+    /// `mem::forget` semantics (forgetting a non-empty drain leaks the kept
+    /// elements; an empty range never takes the cow).
     ///
     /// Use [`Self::drain_owned`] when the cow is known to be owned and `T: Clone`
     /// is unavailable.
@@ -1631,7 +1621,7 @@ impl<'a, T, const N: usize> CovariantCow<'a, T, N> {
     /// Panics if the range's start is greater than its end, or its end is
     /// greater than the length.
     #[track_caller]
-    pub fn drain<R>(&mut self, range: R) -> CowDrain<'_, 'a, T, N>
+    pub fn drain<R>(&mut self, range: R) -> CowDrainLazy<'_, 'a, T, N>
     where
         R: RangeBounds<usize>,
         T: Clone,
@@ -1640,10 +1630,37 @@ impl<'a, T, const N: usize> CovariantCow<'a, T, N> {
         // off the tag bits, so it is correct for the borrowed state too.
         let len = self.raw_len();
         let (begin, end) = crate::drain_bounds(&range, len);
-        if begin != end && self.is_borrowed() {
-            self.to_mut();
+        if !self.is_borrowed() {
+            return CowDrainLazy::from_owned(self.make_drain(begin, end, len));
         }
-        self.make_drain(begin, end, len)
+        if begin == end {
+            // Empty range: stay borrowed, clone nothing.
+            // Safety: reading the borrowed variant.
+            let src: &'a [T] = unsafe { self.data.borrowed };
+            return CowDrainLazy::from_borrowed_empty(self, src, begin);
+        }
+        if size_of::<T>() == 0 {
+            // ZSTs have no storage or clone cost; the owned drain's documented
+            // "adopt then drop removed" accounting is preserved.
+            self.to_mut();
+            return CowDrainLazy::from_owned(self.make_drain(begin, end, len));
+        }
+        // Safety: reading the borrowed variant.
+        let src: &'a [T] = unsafe { self.data.borrowed };
+        // Clone only the kept prefix and suffix now; the removed elements are
+        // cloned lazily as they are yielded (and never if they are not).
+        let mut kept = CovariantCow::new();
+        kept.reserve_owned(len);
+        if begin > 0 {
+            // Safety: `kept` is owned, empty and has capacity for `len`;
+            // `src[..begin]` is a distinct initialized slice.
+            unsafe { T::clone_fill(src.as_ptr(), &mut kept, begin) };
+        }
+        if end < len {
+            // Safety: as above, filling `[begin, begin + len - end)`.
+            unsafe { T::clone_fill_range(src.as_ptr().add(end), &mut kept, begin, len - end) };
+        }
+        CowDrainLazy::from_borrowed_kept(self, src, begin, end, kept)
     }
 
     /// [`Self::drain`] on an **already-owned** cow, without requiring
@@ -1711,15 +1728,23 @@ impl<'a, T, const N: usize> CovariantCow<'a, T, N> {
             // ZST: the count *is* the ownership. Materializing a borrowed
             // `self` adopts its count without cloning; a borrowed `other` is
             // narrowed (no drops) and an owned one transfers its count.
+            //
+            // Validate the combined count *before* any state change: a
+            // capacity-overflow panic must leave a borrowed `self` borrowed
+            // (the non-ZST path below likewise checks capacity before
+            // materializing). `MAX_LEN` is the ZST representable-count bound.
+            let needed = match self.raw_len().checked_add(other_len) {
+                Some(n) if n <= MAX_LEN => n,
+                _ => panic!("capacity overflow"),
+            };
             if self.is_borrowed() {
                 self.to_mut();
             }
             if other.is_borrowed() {
-                self.reserve_owned(other_len);
                 // Same tag-hygiene guard as `push_owned`: the untagged length
                 // write below must never run on a heap-backed ZST cow.
                 assert!(!self.is_heap(), "ZST cows are never heap-backed");
-                self.len = self.raw_len() + other_len;
+                self.len = needed;
                 other.truncate(0);
             } else {
                 self.append_owned(other);
@@ -1969,9 +1994,23 @@ impl<'a, T, const N: usize> CovariantCow<'a, T, N> {
             // correctness.
             let extra = replace_with.size_hint().0.saturating_sub(end - begin);
             if extra == 0 {
-                // Keep `to_mut`'s exact-`len` allocation when the replacement
-                // fits the hole.
-                self.to_mut();
+                if begin == end {
+                    // Empty range on a borrowed cow whose replacement reports
+                    // a zero lower bound but might still yield (`filter`,
+                    // `flat_map`): materialize with a small amount of headroom
+                    // so the `CowSplice` chunk loop does not reallocate for its
+                    // first chunk. `upper != Some(0)` is guaranteed by the
+                    // branch condition above, so `headroom >= 1`.
+                    let headroom = replace_with
+                        .size_hint()
+                        .1
+                        .map_or(crate::SPLICE_CHUNK, |u| u.min(crate::SPLICE_CHUNK));
+                    self.materialize_with_exact_capacity(headroom);
+                } else {
+                    // The replacement fits the hole: `to_mut`'s exact-`len`
+                    // allocation is optimal.
+                    self.to_mut();
+                }
             } else {
                 self.materialize_with_min_capacity(extra);
             }
@@ -2080,13 +2119,60 @@ impl<'a, T, const N: usize> CovariantCow<'a, T, N> {
     ///
     /// Removes all elements `e` for which `f(&e)` returns `false`. See
     /// [`Self::retain_mut`].
+    ///
+    /// A **borrowed** cow is not materialized when every element is kept: the
+    /// scan reads the borrowed slice directly, and only when the first removal
+    /// is found does it build an owned cow from the kept prefix. Removed
+    /// elements are never cloned. If `f` (or a clone) panics, the cow is left
+    /// borrowed and unchanged.
     #[track_caller]
     pub fn retain<F>(&mut self, mut f: F)
     where
         T: Clone,
         F: FnMut(&T) -> bool,
     {
-        self.retain_mut(|x| f(x));
+        if !self.is_borrowed() {
+            self.retain_mut_owned(|x| f(x));
+            return;
+        }
+        if size_of::<T>() == 0 {
+            // ZSTs have no storage and no clone cost; keep the documented
+            // "adopt then drop removed" accounting of `retain_mut`.
+            self.to_mut();
+            self.retain_mut_owned(|x| f(x));
+            return;
+        }
+        let len = self.raw_len();
+        // Safety: reading the borrowed variant. The slice points at external
+        // memory, so it stays valid while we rebuild `self`.
+        let src: &'a [T] = unsafe { self.data.borrowed };
+        // Phase 1: find the first removal without touching `self`.
+        let mut k = 0;
+        while k < len {
+            if !f(&src[k]) {
+                break;
+            }
+            k += 1;
+        }
+        if k == len {
+            // Everything kept: stay borrowed, clone nothing.
+            return;
+        }
+        // Phase 2: build the owned result. Reserving the worst case (all
+        // remaining elements kept) keeps the append loop allocation-free.
+        let mut out = Self::new();
+        out.reserve_owned(len);
+        if k > 0 {
+            // Safety: `out` is owned, empty and has capacity for all `len`
+            // slots; `src[..k]` is a distinct, initialized borrowed slice.
+            unsafe { T::clone_fill(src.as_ptr(), &mut out, k) };
+        }
+        for x in &src[k + 1..] {
+            if f(x) {
+                out.push_owned(x.clone());
+            }
+        }
+        *self = out;
     }
 
     /// [`Self::retain_mut`] on an **already-owned** cow, without requiring
@@ -2405,56 +2491,72 @@ impl<'a, T, const N: usize> CovariantCow<'a, T, N> {
         // block pointer has provenance in the independent allocation, so the
         // per-element length publication (a write to `self.len`, a different
         // location) does not invalidate it under Stacked Borrows, and both
-        // pointer and capacity stay in registers. The loop is single-entry on
-        // purpose: a back edge re-entering it would force LLVM to reload the
-        // state at the join, so the lying-`size_hint` remainder falls through
-        // to the general loop instead. The inline state is handled there too
-        // (it must re-derive per element).
-        if self.is_heap() {
-            let base = self.base_ptr();
-            let cap = self.heap_cap();
-            let mut len = self.raw_len();
-            while len < cap {
-                let Some(x) = it.next() else { return };
-                // Safety: heap state with `len < cap`, so slot `len` is in
-                // bounds and uninitialized; `write` moves `x` in without
-                // dropping it. `base` stays valid across the publication
-                // below (independent block; see above).
-                unsafe { base.add(len).write(x) };
-                len += 1;
-                // Published before the next `it.next()` (user code, may
-                // panic). Owned states have `BORROWED_TAG == 0`, so
-                // `HEAP_TAG | len` is the tag-consistent form.
-                self.len = HEAP_TAG | len;
+        // pointer and capacity stay in registers. A spill inside the general
+        // loop (`push_owned`) re-enters this path for the remainder.
+        loop {
+            if self.is_heap() && !self.extend_heap_fast_owned(&mut it) {
+                return;
             }
-            // Reservation exhausted: the general loop handles the remainder.
-        }
-        // General loop (inline state, or the exhausted-heap remainder):
-        // per-element re-derivation — the length publication invalidates a
-        // hoisted pointer when the elements live inside `self` — and
-        // `push_owned` may spill, after which the per-element `is_heap` test
-        // picks up the heap branch.
-        for x in it {
-            let len = self.raw_len();
-            if len < self.capacity() {
-                // Safety: owned state, `len < capacity`, slot `[len]` is in
-                // bounds and uninitialized; `write` moves `x` in without
-                // dropping it. Owned states have `BORROWED_TAG == 0`, so
-                // preserving `HEAP_TAG` yields the right tag.
-                unsafe {
-                    let p = if self.is_heap() {
-                        self.data.heap.0.cast::<T>().as_ptr().add(len)
-                    } else {
-                        addr_of_mut!(self.data.inline).cast::<T>().add(len)
-                    };
-                    p.write(x);
+            // General loop (inline state, or the exhausted-heap remainder):
+            // per-element re-derivation — the length publication invalidates a
+            // hoisted pointer when the elements live inside `self` — and
+            // `push_owned` may spill.
+            let mut spilled = false;
+            for x in it.by_ref() {
+                let len = self.raw_len();
+                if len < self.capacity() {
+                    // Safety: owned state, `len < capacity`, slot `[len]` is in
+                    // bounds and uninitialized; `write` moves `x` in without
+                    // dropping it. Owned states have `BORROWED_TAG == 0`, so
+                    // preserving `HEAP_TAG` yields the right tag.
+                    unsafe {
+                        let p = if self.is_heap() {
+                            self.data.heap.0.cast::<T>().as_ptr().add(len)
+                        } else {
+                            addr_of_mut!(self.data.inline).cast::<T>().add(len)
+                        };
+                        p.write(x);
+                    }
+                    self.len = (self.len & HEAP_TAG) | (len + 1);
+                } else {
+                    // Spare capacity exhausted; `push_owned` spills/reallocates.
+                    self.push_owned(x);
+                    if self.is_heap() {
+                        spilled = true;
+                        break;
+                    }
                 }
-                self.len = (self.len & HEAP_TAG) | (len + 1);
-            } else {
-                // Spare capacity exhausted; `push_owned` spills/reallocates.
-                self.push_owned(x);
+            }
+            if !spilled {
+                return;
             }
         }
+    }
+
+    /// The heap fast loop shared by entry and post-spill re-entry: hoists the
+    /// block pointer, capacity and length so the per-element work is one
+    /// store and one length publication. Returns `true` when capacity was
+    /// exhausted, `false` when the iterator finished.
+    #[inline]
+    fn extend_heap_fast_owned<I: Iterator<Item = T>>(&mut self, it: &mut I) -> bool {
+        debug_assert!(self.is_heap());
+        let base = self.base_ptr();
+        let cap = self.heap_cap();
+        let mut len = self.raw_len();
+        while len < cap {
+            let Some(x) = it.next() else { return false };
+            // Safety: heap state with `len < cap`, so slot `len` is in bounds
+            // and uninitialized; `write` moves `x` in without dropping it.
+            // `base` stays valid across the publication below (independent
+            // block; see above).
+            unsafe { base.add(len).write(x) };
+            len += 1;
+            // Published before the next `it.next()` (user code, may panic).
+            // Owned states have `BORROWED_TAG == 0`, so `HEAP_TAG | len` is
+            // the tag-consistent form.
+            self.len = HEAP_TAG | len;
+        }
+        true
     }
 
     /// # Safety
@@ -2534,16 +2636,19 @@ impl<'a, T, const N: usize> CloneSink for CovariantCow<'a, T, N> {
 
     #[inline]
     unsafe fn raw_base(&mut self) -> *mut T {
-        // Safe operation: `base_ptr` dispatches on the tag, uses place access,
-        // and itself asserts the non-borrowed state the caller promises.
-        self.base_ptr()
+        // Safe operation: `base_ptr_owned` dispatches on the tag, uses place
+        // access, and only `debug_assert!`s the non-borrowed state the caller
+        // promises (the `CloneSink` contract). Using the real-assert twin here
+        // would re-check the tag once per element in the hot clone loops.
+        unsafe { self.base_ptr_owned() }
     }
 
     #[inline]
     unsafe fn publish_len(&mut self, n: usize) {
         // Safety: `n` slots were just initialized, and `n <= capacity`. The
-        // fill only ever runs in an owned state, which `set_len` re-asserts.
-        unsafe { self.set_len(n) };
+        // fill only ever runs in an owned state, which the primitive
+        // `debug_assert!`s.
+        unsafe { self.publish_len_owned(n) };
     }
 }
 
@@ -2604,10 +2709,12 @@ impl<'a, T: Clone, const N: usize> Clone for CovariantCow<'a, T, N> {
             return;
         }
         // Drop the old contents first: a panic inside `T::clone` then leaves
-        // `self` holding exactly the clones made so far (the fill publishes the
-        // length per element), which `Drop` cleans up — no double drops. The
-        // published length stays `0` until then, so the partially-filled
-        // prefix is invisible to destructors mid-panic.
+        // `self` holding exactly the clones made so far, which `Drop` cleans
+        // up — no double drops. The element-wise fill publishes the length per
+        // element, so the partially-filled prefix is valid (though possibly
+        // not all-cloned) mid-panic; under `specialization` the `T: Copy` fill
+        // publishes once, which is sound because nothing user-visible can run
+        // between the copy and the publication.
         //
         // The ZST case: `clone_fill` reads and writes no bytes, but it still
         // runs `T::clone` `len` times — deliberate (callers count those
@@ -2878,10 +2985,18 @@ impl<'a, T: Clone, const N: usize> Extend<T> for CovariantCow<'a, T, N> {
         }
         let mut it = iter.into_iter();
         let (lo, _) = it.size_hint();
+        if lo > 0 {
+            // Reserve before consuming anything: a capacity-overflow panic
+            // must not leave an element already pulled (and dropped) from the
+            // iterator. This mirrors `Vec::extend`.
+            self.materialize_with_min_capacity(lo);
+            self.extend_owned(it);
+            return;
+        }
         let Some(first) = it.next() else {
             return;
         };
-        self.materialize_with_min_capacity(lo.max(1));
+        self.materialize_with_min_capacity(1);
         self.push_owned(first);
         self.extend_owned(it);
     }
@@ -2907,10 +3022,15 @@ impl<'a, 'b, T: Copy, const N: usize> Extend<&'b T> for CovariantCow<'a, T, N> {
         }
         let mut it = iter.into_iter().copied();
         let (lo, _) = it.size_hint();
+        if lo > 0 {
+            self.materialize_with_min_capacity(lo);
+            self.extend_owned(it);
+            return;
+        }
         let Some(first) = it.next() else {
             return;
         };
-        self.materialize_with_min_capacity(lo.max(1));
+        self.materialize_with_min_capacity(1);
         self.push_owned(first);
         self.extend_owned(it);
     }
@@ -2944,15 +3064,21 @@ impl<'a, 'r, T: Clone, const N: usize> IntoIterator for &'r mut CovariantCow<'a,
 
 impl<'a, T: Clone, const N: usize> IntoIterator for CovariantCow<'a, T, N> {
     type Item = T;
-    type IntoIter = CowIntoIter<'a, T, N>;
-    fn into_iter(mut self) -> Self::IntoIter {
-        // A borrowed cow must be materialized (hence the `T: Clone` bound);
-        // owned states are handed straight to the iterator with no allocation
-        // or copy. For a no-`Clone` owned cow use `into_iter_owned` directly.
+    type IntoIter = CowLazyIntoIter<'a, T, N>;
+    fn into_iter(self) -> Self::IntoIter {
+        // A borrowed cow is consumed **lazily**: the iterator clones elements
+        // from the borrowed slice on demand, so `into_iter().next()` costs one
+        // clone and no allocation. Owned states are handed straight to the
+        // iterator with no allocation or copy. For an owned cow of a
+        // non-`Clone` element use `into_iter_owned` directly.
         if self.is_borrowed() {
-            self.to_mut();
+            // Safety: reading the borrowed variant; the slice points at
+            // external memory and outlives the iterator.
+            let slice: &'a [T] = unsafe { self.data.borrowed };
+            CowLazyIntoIter::from_borrowed(slice)
+        } else {
+            CowLazyIntoIter::from_owned(self)
         }
-        self.into_iter_owned()
     }
 }
 
@@ -2962,10 +3088,11 @@ impl<'a, T: Clone, const N: usize> IntoIterator for CovariantCow<'a, T, N> {
 
 /// Consuming iterator over an **owned** [`CovariantCow`].
 ///
-/// Created by [`CovariantCow::into_iter_owned`], or by `IntoIterator` on a
-/// `CovariantCow` (which materializes a borrowed cow first). Unlike routing
-/// through a `Vec`, this moves elements directly out of the cow's inline or
-/// heap storage, so neither owned state allocates or copies on consumption.
+/// Created by [`CovariantCow::into_iter_owned`]. [`IntoIterator`] returns the
+/// lazy [`CowLazyIntoIter`] instead, so a borrowed cow is not materialized
+/// just to iterate it. Unlike routing through a `Vec`, this moves elements
+/// directly out of the cow's inline or heap storage, so neither owned state
+/// allocates or copies on consumption.
 pub struct CowIntoIter<'a, T, const N: usize> {
     cow: ManuallyDrop<CovariantCow<'a, T, N>>,
     head: usize,
@@ -3113,15 +3240,228 @@ impl<'a, T, const N: usize> Drop for CowIntoIter<'a, T, N> {
 }
 
 // --------------------------------------------------------------------------
+// CowLazyIntoIter
+// --------------------------------------------------------------------------
+
+/// Consuming iterator returned by [`IntoIterator`] for a [`CovariantCow`].
+///
+/// For an **owned** cow this is a thin wrapper around [`CowIntoIter`] with no
+/// allocation or copy. For a **borrowed** cow it is lazy: elements are cloned
+/// out of the borrowed slice on demand, so `into_iter().next()` costs one
+/// clone (and no allocation) rather than cloning the whole slice up front.
+/// Only the still-unconsumed elements are cloned; dropping the iterator drops
+/// nothing (the borrower keeps its slice).
+///
+/// `Send` needs `T: Send + Sync` because the borrowed variant holds a shared
+/// `&'a [T]`; use [`CowIntoIter`] (via [`CovariantCow::into_iter_owned`]) for
+/// an owned `T: Send + !Sync` iterator.
+pub struct CowLazyIntoIter<'a, T, const N: usize> {
+    inner: CowLazyIntoIterInner<'a, T, N>,
+    head: usize,
+    tail: usize,
+}
+
+enum CowLazyIntoIterInner<'a, T, const N: usize> {
+    Borrowed(&'a [T]),
+    Owned(ManuallyDrop<CovariantCow<'a, T, N>>),
+}
+
+impl<'a, T, const N: usize> CowLazyIntoIter<'a, T, N> {
+    fn from_owned(cow: CovariantCow<'a, T, N>) -> Self {
+        debug_assert!(!cow.is_borrowed());
+        let tail = cow.len();
+        CowLazyIntoIter {
+            inner: CowLazyIntoIterInner::Owned(ManuallyDrop::new(cow)),
+            head: 0,
+            tail,
+        }
+    }
+
+    fn from_borrowed(slice: &'a [T]) -> Self {
+        CowLazyIntoIter {
+            inner: CowLazyIntoIterInner::Borrowed(slice),
+            head: 0,
+            tail: slice.len(),
+        }
+    }
+
+    /// Switches a borrowed iterator to owned storage containing only the
+    /// not-yet-consumed elements (cloning them). No-op for the owned variant.
+    fn materialize(&mut self)
+    where
+        T: Clone,
+    {
+        let s: &'a [T] = match &self.inner {
+            CowLazyIntoIterInner::Borrowed(s) => s,
+            CowLazyIntoIterInner::Owned(_) => return,
+        };
+        let rem = &s[self.head..self.tail];
+        let mut cow = CovariantCow::new();
+        if !rem.is_empty() {
+            cow.reserve_owned(rem.len());
+            // Safety: `cow` is owned, empty and has capacity for `rem.len()`;
+            // `rem` is a distinct borrowed slice.
+            unsafe { T::clone_fill(rem.as_ptr(), &mut cow, rem.len()) };
+        }
+        self.inner = CowLazyIntoIterInner::Owned(ManuallyDrop::new(cow));
+        self.head = 0;
+        self.tail = rem.len();
+    }
+
+    /// The not-yet-consumed elements.
+    #[inline]
+    #[must_use]
+    pub fn as_slice(&self) -> &[T] {
+        match &self.inner {
+            CowLazyIntoIterInner::Borrowed(s) => &s[self.head..self.tail],
+            CowLazyIntoIterInner::Owned(cow) => {
+                let n = self.tail - self.head;
+                // Safety: [head, tail) are initialized.
+                unsafe { slice::from_raw_parts(cow.base_ptr_const().add(self.head), n) }
+            }
+        }
+    }
+
+    /// The not-yet-consumed elements, mutably. A borrowed iterator is
+    /// materialized into owned storage first (cloning the remaining
+    /// elements); an owned one needs no work.
+    #[inline]
+    #[must_use]
+    pub fn as_mut_slice(&mut self) -> &mut [T]
+    where
+        T: Clone,
+    {
+        self.materialize();
+        let n = self.tail - self.head;
+        match &mut self.inner {
+            CowLazyIntoIterInner::Owned(cow) => {
+                // Safety: [head, tail) are initialized; `&mut self` excludes
+                // aliases and the variant is owned.
+                unsafe { slice::from_raw_parts_mut(cow.base_ptr_owned().add(self.head), n) }
+            }
+            // `materialize` always leaves the owned variant.
+            CowLazyIntoIterInner::Borrowed(_) => unreachable!(),
+        }
+    }
+
+    /// Drops/frees only the owned variant's remaining elements.
+    ///
+    /// # Safety
+    ///
+    /// Must only be called from `Drop` (terminal position).
+    unsafe fn drop_remaining(&mut self) {
+        let CowLazyIntoIterInner::Owned(cow) = &mut self.inner else {
+            // Borrowed: the borrower owns the slice; nothing to drop.
+            return;
+        };
+        let remaining = self.tail - self.head;
+        if mem::needs_drop::<T>() && remaining > 0 {
+            // Safety: [head, tail) are still initialized and unused; owned
+            // variant (the borrowed one never reaches owned storage).
+            let p = unsafe { cow.base_ptr_owned().add(self.head) };
+            unsafe { ptr::drop_in_place(ptr::slice_from_raw_parts_mut(p, remaining)) };
+        }
+        if cow.is_heap() {
+            // Safety: heap state; layout matches the allocation.
+            let (ptr, cap) = unsafe { cow.data.heap };
+            debug_assert!(size_of::<T>() != 0);
+            unsafe {
+                dealloc(ptr.as_ptr(), crate::heap_layout::<T>(cap));
+            }
+        }
+    }
+}
+
+impl<'a, T: Clone, const N: usize> Iterator for CowLazyIntoIter<'a, T, N> {
+    type Item = T;
+
+    #[inline]
+    fn next(&mut self) -> Option<T> {
+        if self.head >= self.tail {
+            return None;
+        }
+        let idx = self.head;
+        self.head = idx + 1;
+        match &mut self.inner {
+            CowLazyIntoIterInner::Borrowed(s) => Some(s[idx].clone()),
+            CowLazyIntoIterInner::Owned(cow) => {
+                // Safety: slot [idx] is initialized; pointer derived after the
+                // cursor write (Stacked Borrows, as in `CowIntoIter::next`).
+                Some(unsafe { cow.base_ptr_owned().add(idx).read() })
+            }
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.tail - self.head;
+        (n, Some(n))
+    }
+}
+
+impl<'a, T: Clone, const N: usize> DoubleEndedIterator for CowLazyIntoIter<'a, T, N> {
+    #[inline]
+    fn next_back(&mut self) -> Option<T> {
+        if self.head >= self.tail {
+            return None;
+        }
+        self.tail -= 1;
+        let idx = self.tail;
+        match &mut self.inner {
+            CowLazyIntoIterInner::Borrowed(s) => Some(s[idx].clone()),
+            CowLazyIntoIterInner::Owned(cow) => {
+                // Safety: slot [idx] is initialized.
+                Some(unsafe { cow.base_ptr_owned().add(idx).read() })
+            }
+        }
+    }
+}
+
+impl<'a, T: Clone, const N: usize> ExactSizeIterator for CowLazyIntoIter<'a, T, N> {}
+impl<'a, T: Clone, const N: usize> FusedIterator for CowLazyIntoIter<'a, T, N> {}
+
+// Auto traits: the owned variant moves `T` (Send needs `T: Send`), but the
+// borrowed variant shares `&'a [T]` across threads (Send and Sync both need
+// `T: Sync`). The stricter combined bound is required because the variant is
+// a runtime property; `into_iter_owned` is the owned-only escape hatch.
+unsafe impl<'a, T: Send + Sync, const N: usize> Send for CowLazyIntoIter<'a, T, N> {}
+unsafe impl<'a, T: Sync, const N: usize> Sync for CowLazyIntoIter<'a, T, N> {}
+
+impl<'a, T: fmt::Debug, const N: usize> fmt::Debug for CowLazyIntoIter<'a, T, N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("CowLazyIntoIter")
+            .field(&self.as_slice())
+            .finish()
+    }
+}
+
+#[cfg(feature = "dropck_eyepatch")]
+unsafe impl<#[may_dangle] 'a, #[may_dangle] T, const N: usize> Drop for CowLazyIntoIter<'a, T, N> {
+    fn drop(&mut self) {
+        // Safety: terminal position.
+        unsafe { self.drop_remaining() }
+    }
+}
+
+#[cfg(not(feature = "dropck_eyepatch"))]
+impl<'a, T, const N: usize> Drop for CowLazyIntoIter<'a, T, N> {
+    fn drop(&mut self) {
+        // Safety: terminal position.
+        unsafe { self.drop_remaining() }
+    }
+}
+
+// --------------------------------------------------------------------------
 // CowDrain
 // --------------------------------------------------------------------------
 
 /// A draining iterator over a [`CovariantCow`].
 ///
-/// Created by [`CovariantCow::drain`]. For a **non-empty** range the whole
-/// container is moved out and restored on drop (even while unwinding), so the
-/// tail is shifted back and the length restored; the cow is materialized
-/// before draining, so it is always in an owned state while such a `CowDrain`
+/// Created by [`CovariantCow::drain_owned`] and used internally by
+/// `CowSplice`. A borrowed cow is drained through the lazy [`CowDrainLazy`]
+/// instead. For a **non-empty** range the whole container is moved out and
+/// restored on drop (even while unwinding), so the tail is shifted back and
+/// the length restored; the container is always owned while such a `CowDrain`
 /// exists. For an **empty** range nothing is taken: the `CowDrain` is inert,
 /// and a borrowed cow is left borrowed.
 pub struct CowDrain<'r, 'a, T, const N: usize> {
@@ -3232,15 +3572,27 @@ impl<'r, 'a, T, const N: usize> CowDrain<'r, 'a, T, N> {
             pos: self.pos,
             back: self.back,
         };
-        while rb.pos < rb.back {
-            // Safety: `pos < back <= end <= original_len`; slot `pos` holds an
-            // element not yet yielded. (`pos` advances before the drop only for
-            // this loop's bookkeeping — `CowDrainRollback` does not read `pos`,
-            // so the ordering is not load-bearing for the unwind path.)
-            // Safety: owned state (the drain constructor materializes).
-            let p = unsafe { rb.cow.base_ptr_owned().add(rb.pos) };
-            rb.pos += 1;
-            unsafe { ptr::drop_in_place(p) };
+        if rb.cow.is_heap() {
+            // Heap state: hoist the block pointer (provenance is in the
+            // independent allocation; the loop only mutates `rb.pos`).
+            // Safety: owned heap state (the drain constructor materializes).
+            let base = unsafe { rb.cow.base_ptr_owned() };
+            while rb.pos < rb.back {
+                // Safety: `pos < back <= end <= original_len`; slot `pos` holds
+                // an element not yet yielded.
+                let idx = rb.pos;
+                rb.pos += 1;
+                unsafe { ptr::drop_in_place(base.add(idx)) };
+            }
+        } else {
+            while rb.pos < rb.back {
+                // Inline state: the elements live inside `rb.cow`, so re-derive
+                // per element (per-location Stacked-Borrows rule).
+                // Safety: as above.
+                let p = unsafe { rb.cow.base_ptr_owned().add(rb.pos) };
+                rb.pos += 1;
+                unsafe { ptr::drop_in_place(p) };
+            }
         }
     }
 }
@@ -3385,6 +3737,355 @@ impl<'r, 'a, T, const N: usize> Drop for CowDrain<'r, 'a, T, N> {
 }
 
 // --------------------------------------------------------------------------
+// CowDrainLazy
+// --------------------------------------------------------------------------
+
+/// Builds an owned-state [`CowDrain`] for an already-validated `(begin, end)`
+/// range. Free function (rather than a method) so callers that own a
+/// `&'r mut CovariantCow` binding can move the borrow into the returned drain
+/// with its full `'r` lifetime.
+fn make_drain_impl<'r, 'a, T, const N: usize>(
+    slot: &'r mut CovariantCow<'a, T, N>,
+    begin: usize,
+    end: usize,
+    len: usize,
+) -> CowDrain<'r, 'a, T, N> {
+    // Contract: a non-empty range requires an owned cow. Taking
+    // `slot.data.heap` / `mem::take` from a borrowed cow would silently drop
+    // the borrow and hand `Drop` a `*mut T` derived from a shared tag (UB).
+    debug_assert!(
+        begin == end || !slot.is_borrowed(),
+        "make_drain: non-empty range requires an owned cow"
+    );
+    if begin == end {
+        // Empty range: a pure no-op. The container is never taken.
+        return CowDrain {
+            cow: ManuallyDrop::new(CovariantCow::new()),
+            slot,
+            owns: false,
+            begin,
+            pos: begin,
+            end,
+            back: end,
+            original_len: len,
+        };
+    }
+    // As in `CovariantVec::drain`: a heap-backed container is handed over as
+    // a state swap (only `(ptr, cap)` + the tagged length) rather than via
+    // `mem::take`, which would memcpy the `N · size_of::<T>()` inline array
+    // — dead padding in the heap state — and copy it back on rollback.
+    let cow = if slot.is_heap() {
+        // Safety: owned heap state (`make_drain` is only reached with a
+        // materialized cow when the range is non-empty).
+        let (ptr, cap) = unsafe { slot.data.heap };
+        let raw_len = slot.len;
+        // Leave the slot an empty inline cow by writing only `len`; see
+        // `CovariantVec::drain` for why the stale union bytes are inert.
+        slot.len = 0;
+        // Safety: `ptr`/`cap` describe the live block the slot owned and
+        // `raw_len` is its tagged length; ownership moves into the returned
+        // cow, and `slot` no longer refers to the block.
+        CovariantCow {
+            data: Data3 { heap: (ptr, cap) },
+            len: raw_len,
+        }
+    } else {
+        mem::take(slot)
+    };
+    CowDrain {
+        cow: ManuallyDrop::new(cow),
+        slot,
+        owns: true,
+        begin,
+        pos: begin,
+        end,
+        back: end,
+        original_len: len,
+    }
+}
+
+/// Draining iterator returned by [`CovariantCow::drain`].
+///
+/// It has two modes. On an **owned** cow it is exactly a [`CowDrain`] (the
+/// whole container is moved out and restored on drop). On a **borrowed** cow
+/// it is lazy: the kept prefix and suffix are cloned into a fresh owned cow at
+/// construction, while the removed elements are cloned from the borrowed slice
+/// only as they are yielded. A partial drain therefore never clones the
+/// elements it does not yield.
+///
+/// The borrowed mode is safe for an empty range too: it clones nothing and
+/// leaves the cow borrowed.
+///
+/// `Send` needs `T: Send + Sync` because the borrowed mode holds a shared
+/// `&'a [T]`; use [`CovariantCow::drain_owned`] for an owned `T: Send +
+/// !Sync` drain.
+pub struct CowDrainLazy<'r, 'a, T, const N: usize> {
+    inner: CowDrainLazyInner<'r, 'a, T, N>,
+}
+
+enum CowDrainLazyInner<'r, 'a, T, const N: usize> {
+    Empty,
+    Owned(CowDrain<'r, 'a, T, N>),
+    Borrowed {
+        slot: &'r mut CovariantCow<'a, T, N>,
+        src: &'a [T],
+        /// Drain start (kept prefix is `[0, begin)`).
+        begin: usize,
+        /// Drain end (kept suffix is `[end, len)`).
+        end: usize,
+        /// Next front element to yield.
+        pos: usize,
+        /// One past the next back element to yield.
+        back: usize,
+        /// Owned `prefix + suffix`, installed into the slot on drop (or by
+        /// `keep_rest`). `None` for the inert empty-range case.
+        kept: Option<CovariantCow<'a, T, N>>,
+    },
+}
+
+impl<'r, 'a, T, const N: usize> CowDrainLazy<'r, 'a, T, N> {
+    fn from_owned(drain: CowDrain<'r, 'a, T, N>) -> Self {
+        CowDrainLazy {
+            inner: CowDrainLazyInner::Owned(drain),
+        }
+    }
+
+    fn from_borrowed_empty(slot: &'r mut CovariantCow<'a, T, N>, src: &'a [T], at: usize) -> Self {
+        CowDrainLazy {
+            inner: CowDrainLazyInner::Borrowed {
+                slot,
+                src,
+                begin: at,
+                end: at,
+                pos: at,
+                back: at,
+                kept: None,
+            },
+        }
+    }
+
+    fn from_borrowed_kept(
+        slot: &'r mut CovariantCow<'a, T, N>,
+        src: &'a [T],
+        begin: usize,
+        end: usize,
+        kept: CovariantCow<'a, T, N>,
+    ) -> Self {
+        CowDrainLazy {
+            inner: CowDrainLazyInner::Borrowed {
+                slot,
+                src,
+                begin,
+                end,
+                pos: begin,
+                back: end,
+                kept: Some(kept),
+            },
+        }
+    }
+
+    /// Converts a borrowed lazy drain into the fully-owned [`CowDrain`] form,
+    /// cloning the *whole* original cow (needed to hand out `&mut [T]` over
+    /// the removed region). Used only by `as_mut_slice`, so the lazy path is
+    /// not disturbed.
+    fn materialize_owned(&mut self)
+    where
+        T: Clone,
+    {
+        let inner = mem::replace(&mut self.inner, CowDrainLazyInner::Empty);
+        let CowDrainLazyInner::Borrowed {
+            slot,
+            src,
+            begin,
+            end,
+            pos,
+            back,
+            kept,
+        } = inner
+        else {
+            // Owned or already materialized: put it back.
+            self.inner = inner;
+            return;
+        };
+        drop(kept);
+        let len = src.len();
+        let mut full = CovariantCow::new();
+        full.reserve_owned(len);
+        // Safety: `full` is owned, empty and has capacity for `len`;
+        // `src` is a distinct initialized borrowed slice.
+        unsafe { T::clone_fill(src.as_ptr(), &mut full, len) };
+        *slot = full;
+        // Move the slot borrow into the drain with its full `'r` lifetime.
+        let mut owned = make_drain_impl(slot, begin, end, len);
+        // Preserve how much of the removed run was already yielded from each
+        // end; the drain drop only reclaims `[pos, back)`.
+        owned.pos = pos;
+        owned.back = back;
+        self.inner = CowDrainLazyInner::Owned(owned);
+    }
+
+    /// The not-yet-yielded elements.
+    #[inline]
+    #[must_use]
+    pub fn as_slice(&self) -> &[T] {
+        match &self.inner {
+            CowDrainLazyInner::Owned(d) => d.as_slice(),
+            CowDrainLazyInner::Borrowed { src, pos, back, .. } => &src[*pos..*back],
+            CowDrainLazyInner::Empty => &[],
+        }
+    }
+
+    /// The not-yet-yielded elements, mutably. The borrowed mode materializes
+    /// the whole cow first (cloning it), because the removed elements live in
+    /// the borrower's shared slice and cannot be mutated in place.
+    #[inline]
+    #[must_use]
+    pub fn as_mut_slice(&mut self) -> &mut [T]
+    where
+        T: Clone,
+    {
+        self.materialize_owned();
+        match &mut self.inner {
+            CowDrainLazyInner::Owned(d) => d.as_mut_slice(),
+            _ => unreachable!(),
+        }
+    }
+
+    /// Keeps every not-yet-yielded element in the container (std parity with
+    /// `Vec::Drain::keep_rest`). In the borrowed mode the remaining removed
+    /// elements are cloned into the kept cow at the insertion point.
+    pub fn keep_rest(&mut self)
+    where
+        T: Clone,
+    {
+        match &mut self.inner {
+            CowDrainLazyInner::Owned(d) => d.keep_rest(),
+            CowDrainLazyInner::Borrowed {
+                slot,
+                src,
+                begin,
+                pos,
+                back,
+                kept,
+                ..
+            } => {
+                let Some(mut k) = kept.take() else {
+                    // Inert empty-range drain: the container was never taken.
+                    return;
+                };
+                let n = *back - *pos;
+                if n > 0 {
+                    k.reserve_owned(n);
+                    for j in *pos..*back {
+                        let at = *begin + (j - *pos);
+                        k.insert_owned(at, src[j].clone());
+                    }
+                }
+                // The kept run is now part of the container; the remaining
+                // removed elements are no longer yielded.
+                *pos = *back;
+                **slot = k;
+            }
+            CowDrainLazyInner::Empty => {}
+        }
+    }
+
+    fn drop_impl(&mut self) {
+        if let CowDrainLazyInner::Borrowed { slot, kept, .. } = &mut self.inner {
+            if let Some(k) = kept.take() {
+                // Install the owned prefix + suffix; the removed elements are
+                // the borrower's and are simply not part of the cow.
+                **slot = k;
+            }
+        }
+        // Owned mode: the contained `CowDrain`'s own `Drop` does the work when
+        // the enum field is dropped after this body.
+    }
+}
+
+impl<'r, 'a, T: Clone, const N: usize> Iterator for CowDrainLazy<'r, 'a, T, N> {
+    type Item = T;
+
+    #[inline]
+    fn next(&mut self) -> Option<T> {
+        match &mut self.inner {
+            CowDrainLazyInner::Owned(d) => d.next(),
+            CowDrainLazyInner::Borrowed { src, pos, back, .. } => {
+                if *pos == *back {
+                    return None;
+                }
+                let idx = *pos;
+                *pos += 1;
+                Some(src[idx].clone())
+            }
+            CowDrainLazyInner::Empty => None,
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match &self.inner {
+            CowDrainLazyInner::Owned(d) => d.size_hint(),
+            CowDrainLazyInner::Borrowed { pos, back, .. } => {
+                let n = *back - *pos;
+                (n, Some(n))
+            }
+            CowDrainLazyInner::Empty => (0, Some(0)),
+        }
+    }
+}
+
+impl<'r, 'a, T: Clone, const N: usize> DoubleEndedIterator for CowDrainLazy<'r, 'a, T, N> {
+    #[inline]
+    fn next_back(&mut self) -> Option<T> {
+        match &mut self.inner {
+            CowDrainLazyInner::Owned(d) => d.next_back(),
+            CowDrainLazyInner::Borrowed { src, pos, back, .. } => {
+                if *pos == *back {
+                    return None;
+                }
+                *back -= 1;
+                let idx = *back;
+                Some(src[idx].clone())
+            }
+            CowDrainLazyInner::Empty => None,
+        }
+    }
+}
+
+impl<'r, 'a, T: Clone, const N: usize> ExactSizeIterator for CowDrainLazy<'r, 'a, T, N> {}
+impl<'r, 'a, T: Clone, const N: usize> FusedIterator for CowDrainLazy<'r, 'a, T, N> {}
+
+// Auto traits: the owned mode moves `T` (Send needs `T: Send`), but the
+// borrowed mode shares `&'a [T]` across threads (Send and Sync both need
+// `T: Sync`). The stricter combined bound is required because the mode is a
+// runtime property; `drain_owned` is the owned-only entry point.
+unsafe impl<'r, 'a, T: Send + Sync, const N: usize> Send for CowDrainLazy<'r, 'a, T, N> {}
+unsafe impl<'r, 'a, T: Sync, const N: usize> Sync for CowDrainLazy<'r, 'a, T, N> {}
+
+impl<'r, 'a, T: fmt::Debug, const N: usize> fmt::Debug for CowDrainLazy<'r, 'a, T, N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.as_slice()).finish()
+    }
+}
+
+#[cfg(feature = "dropck_eyepatch")]
+unsafe impl<'r, #[may_dangle] 'a, #[may_dangle] T, const N: usize> Drop
+    for CowDrainLazy<'r, 'a, T, N>
+{
+    fn drop(&mut self) {
+        self.drop_impl();
+    }
+}
+
+#[cfg(not(feature = "dropck_eyepatch"))]
+impl<'r, 'a, T, const N: usize> Drop for CowDrainLazy<'r, 'a, T, N> {
+    fn drop(&mut self) {
+        self.drop_impl();
+    }
+}
+
+// --------------------------------------------------------------------------
 // `retain` support (shared with `CovariantVec`)
 // --------------------------------------------------------------------------
 
@@ -3465,6 +4166,20 @@ impl<'r, 'a, T, const N: usize, I: Iterator<Item = T>> Iterator for CowSplice<'r
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.drain.size_hint()
     }
+}
+
+impl<'r, 'a, T, const N: usize, I: Iterator<Item = T>> DoubleEndedIterator
+    for CowSplice<'r, 'a, T, N, I>
+{
+    #[inline]
+    fn next_back(&mut self) -> Option<T> {
+        self.drain.next_back()
+    }
+}
+
+impl<'r, 'a, T, const N: usize, I: Iterator<Item = T>> ExactSizeIterator
+    for CowSplice<'r, 'a, T, N, I>
+{
 }
 
 impl<'r, 'a, T, const N: usize, I: Iterator<Item = T>> FusedIterator
@@ -3592,17 +4307,16 @@ impl<'r, 'a, T, const N: usize, I: Iterator<Item = T>> CowSplice<'r, 'a, T, N, I
         if !self.drain.owns && self.drain.slot.is_borrowed() {
             // Empty range on a borrowed cow: the constructor's upper-hint
             // shortcut left it borrowed, and `Drop` has no `T: Clone` to
-            // materialize it. An honest replacement is empty, so the loop
-            // runs zero times; a replacement that yields is a logic error,
-            // named here rather than failing `insert_owned`'s generic
-            // assertion.
-            for (j, x) in self.replace_with.by_ref().enumerate() {
-                assert!(
-                    !self.drain.slot.is_borrowed(),
-                    "splice replacement yielded an element after reporting an empty size hint"
-                );
-                self.drain.slot.insert_owned(self.drain.begin + j, x);
-            }
+            // materialize it. An honest replacement is empty, so this pulls
+            // zero times; a replacement that yields is a logic error, named
+            // here rather than failing `insert_owned`'s generic assertion.
+            // (The slot is borrowed, so there is no owned storage to insert
+            // into without materializing: the old per-element `insert_owned`
+            // loop could never succeed.)
+            let _ = self.replace_with.next().map(|x| {
+                drop(x);
+                panic!("splice replacement yielded an element after reporting an empty size hint")
+            });
             return;
         }
 
@@ -3745,6 +4459,23 @@ where
         None
     }
 }
+
+impl<'r, 'a, T, const N: usize, F> FusedIterator for CowExtractIf<'r, 'a, T, N, F> where
+    F: FnMut(&mut T) -> bool
+{
+}
+
+// Auto traits: the constructor materializes a borrowed cow, so this type only
+// ever observes an **owned** cow. Moving it between threads therefore moves
+// owned `T`s (Send needs `T: Send`) plus the `&mut` borrow, exactly like
+// `CowDrain`/`CowIntoIter`; the stiffer `T: Send + Sync` of the borrowed
+// `CovariantCow` state is not needed. `Sync` shares `&CowExtractIf`; the only
+// interior mutability is the predicate, hence the `F: Sync` bound.
+//
+// Safety: `extract_if` materializes first and `extract_if_owned` asserts
+// `!is_borrowed`, so no path can observe the borrowed union variant.
+unsafe impl<'r, 'a, T: Send, const N: usize, F: Send> Send for CowExtractIf<'r, 'a, T, N, F> {}
+unsafe impl<'r, 'a, T: Sync, const N: usize, F: Sync> Sync for CowExtractIf<'r, 'a, T, N, F> {}
 
 impl<'r, 'a, T, const N: usize, F> CowExtractIf<'r, 'a, T, N, F> {
     /// Shared `Drop` body: compacts the untouched tail over the dead holes
